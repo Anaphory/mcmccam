@@ -1,5 +1,5 @@
 import numpy
-import deepcopy
+from copy import deepcopy
 import typing
 import itertools
 import bisect
@@ -10,8 +10,13 @@ L = typing.TypeVar("L", bound=typing.Hashable)
 
 
 class History(typing.Generic[L]):
+    end: float
+
     def __init__(
-        self, start: typing.Sequence[L], changes: typing.Iterable[tuple[float, int, L]]
+        self,
+        start: typing.Sequence[L],
+        changes: typing.Iterable[tuple[float, int, L]],
+        end: typing.Optional[float] = None,
     ) -> None:
         """Store a history.
 
@@ -27,6 +32,7 @@ class History(typing.Generic[L]):
         self._times = numpy.full((1, len(start)), numpy.inf)
         self._states = numpy.zeros((0, len(start)), dtype=start.dtype)
         history_depth = {}
+        time = 0.0
         for time, node, new_value in changes:
             try:
                 history_depth[node] += 1
@@ -42,6 +48,11 @@ class History(typing.Generic[L]):
             self._times[history_depth[node], node] = time
             self._states[history_depth[node], node] = new_value
         self._states = numpy.vstack((start[None, :], self._states))
+        if end is None:
+            end = time
+        if end < time:
+            raise ValueError("End time before the last event.")
+        self.end = end
 
     def all_changes(self) -> typing.Iterable[tuple[float, int, L]]:
         """List all changes documented in this history.
@@ -68,8 +79,55 @@ class History(typing.Generic[L]):
             for nodeslice, (time, state) in enumerate(
                 zip(self._times[:-1].flat, self._states[1:].flat)
             )
-            if time < numpy.inf
+            if time <= self.end
         )
+
+    def related(self, node: int, time: float, connections: typing.Iterable[int]):
+        """Find all the changes that are related to the state of this node at this time.
+
+        Given a node, find the time interval where this node has this value,
+        and then return all other changes as (time, node, new value) triples
+        where the node is connected to this node according to the connections
+        and the time is in the interval. (If the time given matches a time of
+        change, it is taken as the start of the interval, as usual.)
+
+        NOTE: The changes are returned in node order, then for each node in
+        time order. To get an overall time order, use `sorted()` etc.
+
+        Examples
+        ========
+
+        >>> h = History(
+        ...   numpy.array(["A", "A", "B"], dtype="<U1"),
+        ...   [(0.05, 2, "A"),
+        ...    (0.1, 0, "C"),
+        ...    (0.25, 1, "C"),
+        ...    (0.3, 2, "B"),
+        ...    (0.4, 0, "B"),
+        ...    (0.5, 1, "B")],
+        ...    0.6)
+        >>> list(h.related(0, 0.05, [1, 2]))
+        [(0.05, 2, 'A')]
+        >>> list(h.related(0, 0.15, [1, 2]))
+        [(0.25, 1, 'C'), (0.3, 2, 'B')]
+        >>> list(h.related(0, 0.1, [1, 2])) == _
+        True
+
+        """
+        time_slice = bisect.bisect(self._times[:, node], time)
+        interval: tuple[float, float]
+        if time_slice == 0:
+            interval = 0.0, self._times[time_slice, node]
+        else:
+            interval = self._times[time_slice - 1, node], self._times[time_slice, node]
+        for other_node in connections:
+            start = bisect.bisect(self._times[:, other_node], interval[0])
+            end = bisect.bisect(self._times[:, other_node], interval[1])
+            if start == end:
+                # No change to that node in this interval
+                continue
+            for i in range(start, end):
+                yield self._times[i, other_node], other_node, self._states[i+1, other_node]
 
     def at(self, node: int, time: float) -> L:
         """Look up the value of a node at a particular time.
@@ -427,14 +485,14 @@ class History(typing.Generic[L]):
             )
         )
 
-    def loglikelihood(self, end_time, copy_rate_matrix, mutation_rate, nlang):
+    def loglikelihood(self, copy_rate_matrix, mutation_rate, nlang, end=None):
         """Calculate the complete likelihood of the history.
 
         >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
         >>> start = ["A", "A", "B"]
         >>> nlang = 5
         >>> mu = 0.5
-        >>> h = History(start, [])
+        >>> h = History(start, [], 1.0)
 
         With rates adding up to 7.5, of which 5.2 induce change, the
         probability of observing nothing is rather low (but not as low as taken
@@ -449,10 +507,10 @@ class History(typing.Generic[L]):
         so that should be (up to some rounding) the likelihood of still seeing
         an empty history after 1 time unit:
 
-        >>> numpy.exp(h.loglikelihood(1.0, matrix, mu, nlang))
+        >>> numpy.exp(h.loglikelihood(matrix, mu, nlang))
         0.0055165644207607716
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(1.0, matrix, mu, nlang)),
+        ...   numpy.exp(h.loglikelihood(matrix, mu, nlang)),
         ...   numpy.exp(-5.2)
         ... )
         True
@@ -460,8 +518,8 @@ class History(typing.Generic[L]):
         Of course, if all starting values are identical and no mutations
         happen, the likelihood of nothing observable happening any more is 1.0.
 
-        >>> constant = History(["A", "A", "A"], [])
-        >>> numpy.exp(constant.loglikelihood(1.0, matrix, 0.0, 100))
+        >>> constant = History(["A", "A", "A"], [], 1.0)
+        >>> numpy.exp(constant.loglikelihood(matrix, 0.0, 100))
         1.0
 
         If there are events, their likelihood is included. Consider a simple
@@ -469,9 +527,9 @@ class History(typing.Generic[L]):
 
         >>> matrix = numpy.array([[0, 1], [1, 0]])
         >>> mu = 1
-        >>> h = History(["A", "A"], [(0.5, 0, "B"), (1.0, 1, "B")])
+        >>> h = History(["A", "A"], [(0.5, 0, "B"), (1.0, 1, "B")], end=2.0)
 
-        The probability to see this history after 2 time units is composed of
+        The probability to see this history is composed of
 
          - The probability that the first change happen at t=0.5. There are two
            possible change events, each happening with rate 0.5 (mutation rate
@@ -486,7 +544,7 @@ class History(typing.Generic[L]):
            >>> h.calculate_change_likelihood(0, "B", 0.5, matrix, mu, 2)
            0.5
 
-        >>> numpy.exp(h.loglikelihood(0.5, matrix, mu, 2)) == numpy.exp(-0.5) * 0.5
+        >>> numpy.exp(h.loglikelihood(matrix, mu, 2, end=0.5)) == numpy.exp(-0.5) * 0.5
         True
 
          - The probability that the second change happen at t=1.0. Now there
@@ -500,7 +558,7 @@ class History(typing.Generic[L]):
            probability 1/2.
 
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(1.0, matrix, mu, 2)),
+        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, end=1.0)),
         ...   numpy.exp(-0.5) * 0.5 * 3*numpy.exp(-1.5) * 0.5)
         True
 
@@ -508,11 +566,13 @@ class History(typing.Generic[L]):
            happens for another 1.0 time units, which has probabilty exp(-1).
 
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(2.0, matrix, mu, 2)),
+        ...   numpy.exp(h.loglikelihood(matrix, mu, 2)),
         ...   numpy.exp(-0.5) * 0.5 * 3*numpy.exp(-1.5) * 0.5 * numpy.exp(-1))
         True
 
         """
+        if end is None:
+            end = self.end
         prev_time = 0.0
         logp = 0.0
         state = self._states[0].copy()
@@ -524,7 +584,7 @@ class History(typing.Generic[L]):
             copy_rate_matrix * observable_transition
         ).sum() + mutation_change_rate
         for time, node, value in self.all_changes():
-            if time > end_time:
+            if time > end:
                 break
             # Contribution from waiting time
             logp += expon(scale=1 / rate_of_observable_change).logpdf(time - prev_time)
@@ -543,20 +603,28 @@ class History(typing.Generic[L]):
                 copy_rate_matrix * observable_transition
             ).sum() + mutation_change_rate
         return logp + expon(scale=1 / rate_of_observable_change).logsf(
-            end_time - prev_time
+            end - prev_time
         )
+
 
 # GOALS:
 # (a) A Gibbs operator that changes the value intervall between two subsequent changes of one node, based on all changes on adjacent nodes that interact with this change [ie. all that have either the old or the new value]
 # (b) A Gibbs operator that changes the position of a change between the change before and the change after. This includes creating a change, from sliding it in from before the start/after the endof the observed interval, or deleting a change, from sliding it out of the observed interval.
 # (c) A pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
 
+
 def add_pair_of_changes(history):
     ...
+
+
 def split_change(history):
     ...
+
+
 def merge_changes(history):
     ...
+
+
 def gibbs_redraw_change(history: History):
     all_changes = history.all_changes()
     time, node, value = all_changes[numpy.random.randint(len(all_changes))]
@@ -570,73 +638,78 @@ def gibbs_redraw_change(history: History):
         cump.append(p_i + cump[-1])
     new_value = bisect.bisect(cump[1:], numpy.random.random())
 
+
 def slide_change(history):
     ...
 
-def redraw_change(history: history):
+
+def redraw_change(history: History):
     ...
 
-def select_operator():
 
-end = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
-end_time = 1
-matrix = numpy.diag([1 for _ in end[1:]], 1) + numpy.diag([1 for _ in end[1:]], -1)
-nlang = 200
-history = History(end, [])
-mu = 1e-4
-log_likelihood = history.loglikelihood(end_time, matrix, mu, nlang)
-while True:
-    operator = select_operator()
-    candidate_history = operator(deepcopy.deepcopy(history))
-    candidate_log_likelihood = candidate_history.loglikelihood(
-        end_time, matrix, mu, nlang
-    )
-    if candidate_log_likelihood > log_likelihood:
-        history = candidate_history
-    else:
-        p = numpy.exp(candidate_log_likelihood - log_likelihood)
-        if numpy.random.random() < p:
-            history = candidate_history
+def select_operator():
+    ...
 
 
 if __name__ == "__main__":
-    start = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
+    end = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
+    end_time = 1
+    matrix = numpy.diag([1 for _ in end[1:]], 1) + numpy.diag([1 for _ in end[1:]], -1)
+    nlang = 200
+    history = History(end, [])
+    mu = 1e-4
+    log_likelihood = history.loglikelihood(end_time, matrix, mu, nlang)
+    while True:
+        operator = select_operator()
+        candidate_history = operator(deepcopy(history))
+        candidate_log_likelihood = candidate_history.loglikelihood(
+            end_time, matrix, mu, nlang
+        )
+        if candidate_log_likelihood > log_likelihood:
+            history = candidate_history
+        else:
+            p = numpy.exp(candidate_log_likelihood - log_likelihood)
+            if numpy.random.random() < p:
+                history = candidate_history
 
-    copy_rate_matrix = numpy.diag([1 for _ in start[1:]], 1) + numpy.diag(
-        [1 for _ in start[1:]], -1
-    )
-    mutation_rate = 1e-3
+    if __name__ == "__main__":
+        start = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
 
-    image = start.copy()[None, :]
+        copy_rate_matrix = numpy.diag([1 for _ in start[1:]], 1) + numpy.diag(
+            [1 for _ in start[1:]], -1
+        )
+        mutation_rate = 1e-3
 
-    NLANG = 200
+        image = start.copy()[None, :]
 
-    def generate_history(start, end_time, rate_matrix):
-        time = 0
-        ps = numpy.cumsum(rate_matrix.flat)
-        total_rate = ps[-1] + mutation_rate * len(start)
-        time += numpy.random.exponential(1 / total_rate)
-        while time < end_time:
-            try:
-                x = numpy.random.random() * total_rate
-                edgefrom, edgeto = numpy.unravel_index(
-                    bisect.bisect(ps, x), rate_matrix.shape
-                )
-                if start[edgeto] == start[edgefrom]:
-                    continue
-                start[edgeto] = start[edgefrom]
-            except ValueError:
-                lang = numpy.random.randint(NLANG)
-                edgeto = numpy.random.randint(len(start))
-                if start[edgeto] == lang:
-                    continue
-                start[edgeto] = lang
+        NLANG = 200
 
-            yield time, edgeto, start[edgeto]
+        def generate_history(start, end_time, rate_matrix):
+            time = 0
+            ps = numpy.cumsum(rate_matrix.flat)
+            total_rate = ps[-1] + mutation_rate * len(start)
             time += numpy.random.exponential(1 / total_rate)
+            while time < end_time:
+                try:
+                    x = numpy.random.random() * total_rate
+                    edgefrom, edgeto = numpy.unravel_index(
+                        bisect.bisect(ps, x), rate_matrix.shape
+                    )
+                    if start[edgeto] == start[edgefrom]:
+                        continue
+                    start[edgeto] = start[edgefrom]
+                except ValueError:
+                    lang = numpy.random.randint(NLANG)
+                    edgeto = numpy.random.randint(len(start))
+                    if start[edgeto] == lang:
+                        continue
+                    start[edgeto] = lang
 
-    for i in generate_history(start, 100, copy_rate_matrix):
-        image = numpy.vstack((image, start[None, :]))
+                yield time, edgeto, start[edgeto]
+                time += numpy.random.exponential(1 / total_rate)
 
-    plt.imshow(image.T, aspect="auto", interpolation="nearest")
-    plt.show()
+        for i in generate_history(start, 100, copy_rate_matrix):
+            image = numpy.vstack((image, start[None, :]))
+
+        plt.imshow(image.T, aspect="auto", interpolation="nearest")
+        plt.show()
