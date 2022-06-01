@@ -29,8 +29,8 @@ class History(typing.Generic[L]):
 
         """
         start = numpy.asarray(start)
-        self._times = numpy.full((1, len(start)), numpy.inf)
-        self._states = numpy.zeros((0, len(start)), dtype=start.dtype)
+        self._states = start[None, :]
+        self._times = numpy.full_like(self._states, numpy.inf, dtype=float)
         history_depth = {}
         time = 0.0
         for time, node, new_value in changes:
@@ -38,6 +38,8 @@ class History(typing.Generic[L]):
                 history_depth[node] += 1
             except KeyError:
                 history_depth[node] = 0
+            if new_value == self._states[history_depth[node], node]:
+                raise ValueError("Event is no change")
             if history_depth[node] + 1 >= self._times.shape[0]:
                 self._times = numpy.vstack(
                     (self._times, numpy.full((1, len(start)), numpy.inf))
@@ -46,13 +48,15 @@ class History(typing.Generic[L]):
                     (self._states, numpy.zeros((1, len(start)), dtype=start.dtype))
                 )
             self._times[history_depth[node], node] = time
-            self._states[history_depth[node], node] = new_value
-        self._states = numpy.vstack((start[None, :], self._states))
+            self._states[history_depth[node] + 1, node] = new_value
         if end is None:
             end = time
         if end < time:
             raise ValueError("End time before the last event.")
         self.end = end
+
+    def __repr__(self):
+        return f"History({self.start()!r}, {self.all_changes()}, {self.end})"
 
     def all_changes(self) -> typing.Iterable[tuple[float, int, L]]:
         """List all changes documented in this history.
@@ -82,7 +86,15 @@ class History(typing.Generic[L]):
             if time <= self.end
         )
 
-    def related(self, node: int, time: float, connections: typing.Iterable[int]):
+    def start(self) -> numpy.ndarray:
+        """Return the start state."""
+        view = self._states[0]
+        view.flags.writeable = False
+        return view
+
+    def related(
+        self, time: float, node: int, connections: typing.Iterable[int]
+    ) -> typing.Iterator[tuple[float, int, L]]:
         """Find all the changes that are related to the state of this node at this time.
 
         Given a node, find the time interval where this node has this value,
@@ -90,9 +102,6 @@ class History(typing.Generic[L]):
         where the node is connected to this node according to the connections
         and the time is in the interval. (If the time given matches a time of
         change, it is taken as the start of the interval, as usual.)
-
-        NOTE: The changes are returned in node order, then for each node in
-        time order. To get an overall time order, use `sorted()` etc.
 
         Examples
         ========
@@ -106,12 +115,24 @@ class History(typing.Generic[L]):
         ...    (0.4, 0, "B"),
         ...    (0.5, 1, "B")],
         ...    0.6)
-        >>> list(h.related(0, 0.05, [1, 2]))
-        [(0.05, 2, 'A')]
-        >>> list(h.related(0, 0.15, [1, 2]))
-        [(0.25, 1, 'C'), (0.3, 2, 'B')]
-        >>> list(h.related(0, 0.1, [1, 2])) == _
+        >>> list(h.related(0.05, 0, [1, 2]))
+        [(0.05, 2, 'A'), (0.1, 0, 'C')]
+        >>> list(h.related(0.15, 0, [1, 2]))
+        [(0.25, 1, 'C'), (0.3, 2, 'B'), (0.4, 0, 'B')]
+        >>> list(h.related(0.1, 0, [1, 2])) == _
         True
+        >>> list(h.related(0.45, 0, [1, 2]))
+        [(0.5, 1, 'B')]
+        >>> list(h.related(0.55, 1, [0, 2]))
+        []
+
+        NOTE: The changes are returned in node order (as given by
+        `connections`, followed by the subsequent change of `node` itself if
+        there is one), then for each node in time order. To get an overall time
+        order, use `sorted()` etc.
+
+        >>> list(h.related(0.4, 1, [0, 2]))
+        [(0.4, 0, 'B'), (0.3, 2, 'B'), (0.5, 1, 'B')]
 
         """
         time_slice = bisect.bisect(self._times[:, node], time)
@@ -127,9 +148,21 @@ class History(typing.Generic[L]):
                 # No change to that node in this interval
                 continue
             for i in range(start, end):
-                yield self._times[i, other_node], other_node, self._states[i+1, other_node]
+                if self._times[i, other_node] > self.end:
+                    continue
+                try:
+                    yield self._times[i, other_node], other_node, self._states[
+                        i + 1, other_node
+                    ]
+                except IndexError:
+                    continue
+        try:
+            yield interval[1], node, self._states[time_slice + 1, node]
+        except IndexError:
+            # There is no following change of this node.
+            pass
 
-    def at(self, node: int, time: float) -> L:
+    def at(self, time: float, node: int) -> L:
         """Look up the value of a node at a particular time.
 
         Examples
@@ -141,43 +174,43 @@ class History(typing.Generic[L]):
 
         So at the start, every node has value A.
 
-        >>> h.at(0, 0.0)
+        >>> h.at(0.0, 0)
         'A'
-        >>> h.at(1, 0.0)
+        >>> h.at(0.0, 1)
         'A'
 
         At time 0.3, both nodes have changed to C.
 
-        >>> h.at(0, 0.3)
+        >>> h.at(0.3, 0)
         'C'
-        >>> h.at(1, 0.3)
+        >>> h.at(0.3, 1)
         'C'
 
         For the exact time of a change, the function reports the new value.
 
-        >>> h.at(1, 0.25)
+        >>> h.at(0.25, 1)
         'C'
 
 
         In the end, the nodes have changed to B and C.
 
-        >>> h.at(0, 999.)
+        >>> h.at(999., 0)
         'B'
-        >>> h.at(1, 999.)
+        >>> h.at(999., 1)
         'C'
 
         Going back before the start is also possible, and just returns the
         starting values.
 
-        >>> h.at(0, -999.)
+        >>> h.at(-999., 0)
         'A'
-        >>> h.at(1, -999.)
+        >>> h.at(-999., 1)
         'A'
         """
         time_slice = bisect.bisect(self._times[:, node], time)
         return self._states[time_slice, node]
 
-    def before(self, node: int, time: float) -> L:
+    def before(self, time: float, node: int) -> L:
         """Look up the value of a node infinitesimally before a particular time.
 
         In most cases, this is the same as History.at(), except when the node
@@ -192,17 +225,17 @@ class History(typing.Generic[L]):
         ...   [(0.1, 0, "C"), (0.25, 1, "C"), (0.4, 0, "B")])
 
         >>> for node, time in [
-        ...     (0, 0.0), (1, 0.0), (0, 0.3), (1, 0.3),
-        ...     (0, 999.), (1, 999.), (0, -999.), (1, -999.)]:
+        ...     (0.0, 0), (0.0, 1), (0.3, 0), (0.3, 1),
+        ...     (999., 0), (999., 1), (-999., 0), (-999., 1)]:
         ...   assert h.at(node, time) == h.before(node, time)
 
         For the exact time of a change, the function reports the old value.
 
-        >>> h.before(0, 0.1)
+        >>> h.before(0.1, 0)
         'A'
-        >>> h.before(1, 0.25)
+        >>> h.before(0.25, 1)
         'A'
-        >>> h.before(0, 0.4)
+        >>> h.before(0.4, 0)
         'C'
 
         """
@@ -211,9 +244,9 @@ class History(typing.Generic[L]):
 
     def calculate_event_likelihood(
         self,
+        time: float,
         node: int,
         new_state: L,
-        time: float,
         copy_rate_matrix: numpy.ndarray,
         mutation_rate: float,
         nlang: int,
@@ -259,14 +292,14 @@ class History(typing.Generic[L]):
         changing node 1 to A or C, or changing node 2 to A or B – so each has
         probability 1/6.
 
-        >>> h.calculate_event_likelihood(0, "B", 0.2, matrix, 0.0, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "B", matrix, 0.0, 5)
         0.16666666666666666
-        >>> h.calculate_event_likelihood(1, "A", 0.2, matrix, 0.0, 5)
+        >>> h.calculate_event_likelihood(0.2, 1, "A", matrix, 0.0, 5)
         0.16666666666666666
 
         No other change has positive probability.
         >>> for i in "A", "D", "E":
-        ...   print(h.calculate_event_likelihood(0, "D", 0.2, matrix, 0.0, 5))
+        ...   print(h.calculate_event_likelihood(0.2, 0, "D", matrix, 0.0, 5))
         0.0
         0.0
         0.0
@@ -289,15 +322,15 @@ class History(typing.Generic[L]):
         So the probability of a change to A, D, or E is 1/(25*3), whereas a
         change to B or C happens in 2/(5*3) + 1/(25*3) of cases.
 
-        >>> h.calculate_event_likelihood(0, "B", 0.2, matrix, mu, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "B", matrix, mu, 5)
         0.14666666666666667
-        >>> h.calculate_event_likelihood(0, "C", 0.2, matrix, mu, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "C", matrix, mu, 5)
         0.14666666666666667
-        >>> h.calculate_event_likelihood(0, "A", 0.2, matrix, mu, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "A", matrix, mu, 5)
         0.013333333333333332
-        >>> h.calculate_event_likelihood(0, "D", 0.2, matrix, mu, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "D", matrix, mu, 5)
         0.013333333333333332
-        >>> h.calculate_event_likelihood(0, "E", 0.2, matrix, mu, 5)
+        >>> h.calculate_event_likelihood(0.2, 0, "E", matrix, mu, 5)
         0.013333333333333332
 
         """
@@ -308,7 +341,7 @@ class History(typing.Generic[L]):
         odds_state = mutation_rate / nlang
         total_odds = mutation_rate
         for edgefrom, p in enumerate(copy_rate_matrix[:, node]):
-            neighbor_state = self.before(edgefrom, time)
+            neighbor_state = self.before(time, edgefrom)
             if neighbor_state == new_state:
                 odds_state += p
             total_odds += p
@@ -355,17 +388,17 @@ class History(typing.Generic[L]):
          - Node 0 copies state A from node 1 (at rate 1),
          - Node 0 mutates to state A randomly (p=1/5 at rate 0.5)
         together at likelihood
-        >>> h.calculate_event_likelihood(0, "A", 0.2, matrix, mu, nlang)
+        >>> h.calculate_event_likelihood(0.2, 0, "A", matrix, mu, nlang)
         0.14666666666666667
 
          - Node 1 copies state A from node 0 (at rate 1),
          - Node 1 mutates to state A randomly (p=1/5 at rate 0.5)
         together at likelihood
-        >>> h.calculate_event_likelihood(1, "A", 0.2, matrix, mu, nlang)
+        >>> h.calculate_event_likelihood(0.2, 1, "A", matrix, mu, nlang)
         0.14666666666666667
 
         - Node 2 mutates to state B randomly (p=1/5 at rate 0.5)
-        >>> h.calculate_event_likelihood(2, "B", 0.2, matrix, mu, nlang)
+        >>> h.calculate_event_likelihood(0.2, 2, "B", matrix, mu, nlang)
         0.013333333333333332
 
         Together, this is a likelihood of
@@ -384,17 +417,17 @@ class History(typing.Generic[L]):
         """
         p = 0
         for node in range(self._states.shape[1]):
-            state_before = self.before(node, time)
+            state_before = self.before(time, node)
             p += self.calculate_event_likelihood(
-                node, state_before, time, copy_rate_matrix, mutation_rate, nlang
+                time, node, state_before, copy_rate_matrix, mutation_rate, nlang
             )
         return p
 
     def calculate_change_likelihood(
         self,
+        time: float,
         node: int,
         new_state: L,
-        time: float,
         copy_rate_matrix: numpy.ndarray,
         mutation_rate: float,
         nlang: int,
@@ -443,7 +476,7 @@ class History(typing.Generic[L]):
         Then a first event (let us assume at time 0.2) that sets the new value
         of node 0 to A is no change.
 
-        >>> h.calculate_change_likelihood(0, "A", 0.2, matrix, mu, nlang)
+        >>> h.calculate_change_likelihood(0.2, 0, "A", matrix, mu, nlang)
         Traceback (most recent call last):
           ...
         ValueError: Event is no change
@@ -453,9 +486,9 @@ class History(typing.Generic[L]):
         addition, 4 out of 5 mutation events for each node are observable, each
         with equal probability (rate 0.1 each). So node 2 gaining state A has a
         probability of (2+0.1)/(2+2+3*0.4) = 21/52
-        >>> h.calculate_change_likelihood(2, "A", 0.2, matrix, mu, nlang) * 52
+        >>> h.calculate_change_likelihood(0.2, 2, "A", matrix, mu, nlang) * 52
         20.999999999999996
-        >>> h.calculate_change_likelihood(2, "C", 0.2, matrix, mu, nlang) * 52
+        >>> h.calculate_change_likelihood(0.2, 2, "C", matrix, mu, nlang) * 52
         0.9999999999999999
 
         All the valid likelihoods obviously add up to 1.
@@ -463,7 +496,7 @@ class History(typing.Generic[L]):
         >>> for node in 0,1,2:
         ...   for state in "A", "B", "C", "D", "E":
         ...     try:
-        ...       p += h.calculate_change_likelihood(node, state, 0.2, matrix, mu, nlang)
+        ...       p += h.calculate_change_likelihood(0.2, node, state, matrix, mu, nlang)
         ...     except ValueError:
         ...       print(node, state)
         ...
@@ -474,10 +507,10 @@ class History(typing.Generic[L]):
         1.0
 
         """
-        if self.before(node, time) == new_state:
+        if self.before(time, node) == new_state:
             raise ValueError("Event is no change")
         return self.calculate_event_likelihood(
-            node, new_state, time, copy_rate_matrix, mutation_rate, nlang
+            time, node, new_state, copy_rate_matrix, mutation_rate, nlang
         ) / (
             1
             - self.calculate_no_change_likelihood(
@@ -485,7 +518,9 @@ class History(typing.Generic[L]):
             )
         )
 
-    def loglikelihood(self, copy_rate_matrix, mutation_rate, nlang, end=None):
+    def loglikelihood(
+        self, copy_rate_matrix, mutation_rate, nlang, start=0.0, end=None
+    ):
         """Calculate the complete likelihood of the history.
 
         >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
@@ -541,7 +576,7 @@ class History(typing.Generic[L]):
            1 flips to B, which happens at the same rate, so this has
            probability 1/2.
 
-           >>> h.calculate_change_likelihood(0, "B", 0.5, matrix, mu, 2)
+           >>> h.calculate_change_likelihood(0.5, 0, "B", matrix, mu, 2)
            0.5
 
         >>> numpy.exp(h.loglikelihood(matrix, mu, 2, end=0.5)) == numpy.exp(-0.5) * 0.5
@@ -573,7 +608,7 @@ class History(typing.Generic[L]):
         """
         if end is None:
             end = self.end
-        prev_time = 0.0
+        prev_time = start
         logp = 0.0
         state = self._states[0].copy()
         observable_transition = state[None, :] != state[:, None]
@@ -587,23 +622,211 @@ class History(typing.Generic[L]):
             if time > end:
                 break
             # Contribution from waiting time
-            logp += expon(scale=1 / rate_of_observable_change).logpdf(time - prev_time)
-            prev_time = time
+            if time > start:
+                logp += expon(scale=1 / rate_of_observable_change).logpdf(
+                    time - prev_time
+                ) + numpy.log(
+                    self.calculate_change_likelihood(
+                        time, node, value, copy_rate_matrix, mutation_rate, nlang
+                    )
+                )
+                prev_time = time
 
             # Contribution from change
-            logp += numpy.log(
-                self.calculate_change_likelihood(
-                    node, value, time, copy_rate_matrix, mutation_rate, nlang
-                )
-            )
             state[node] = value
             observable_transition[node, :] = state != value
             observable_transition[:, node] = state != value
             rate_of_observable_change = (
                 copy_rate_matrix * observable_transition
             ).sum() + mutation_change_rate
-        return logp + expon(scale=1 / rate_of_observable_change).logsf(
-            end - prev_time
+        return logp + expon(scale=1 / rate_of_observable_change).logsf(end - prev_time)
+
+    def alternatives_with_likelihood(
+        self,
+        node: int,
+        time: float,
+        copy_rate_matrix: numpy.ndarray,
+        mutation_rate: float,
+        nlang: int,
+    ) -> typing.Iterable[tuple[int, float]]:
+        """Calculate the possible alternatives for the specified change.
+
+        In a history where a given node changes at a given time, compute the
+        probability of each value the node could take, given the other parts of the
+        history.
+
+        """
+        alternative_history = deepcopy(self)
+        time_slice = bisect.bisect(alternative_history._times[:, node], time)
+        is_neighbor = (copy_rate_matrix[:, node] > 0) | (copy_rate_matrix[node, :] > 0)
+        neighbors = numpy.arange(len(is_neighbor))[is_neighbor]
+        dependent_changes = list(self.related(time, node, neighbors))
+        try:
+            next_time, next_node, next_value = dependent_changes[-1]
+            if next_node != node:
+                raise IndexError
+            dependent_changes.pop()
+            forbidden_values = {self.before(time, node), next_value}
+        except IndexError:
+            # This is the last recorded value of this node in this history.
+            forbidden_values = {self.before(time, node)}
+        nontrivial_values = {v for _, _, v in dependent_changes}
+        dependent_changes.insert(
+            0, (time, node, alternative_history._states[time_slice, node])
+        )
+        # Well, that's a lie. The ‘trivial’ values are not exactly trivial to
+        # compute. But they all have the same likelihood, so they can all be
+        # handled the same.
+        trivial_values = set(range(nlang)) - nontrivial_values - forbidden_values
+
+        for value in nontrivial_values:
+            likelihood = 1.0
+            alternative_history._states[time_slice, node] = value
+            for d_time, d_node, d_value in dependent_changes:
+                # if d_value is the same as value, then the probability of seeing no change in either goes up by the connection strength.
+                # if d_value is different from value, then the probability of seeing no change in either goes down by the connection strength.
+                likelihood *= expon(
+                    scale=1
+                    / (copy_rate_matrix[d_node, node] + copy_rate_matrix[node, d_node])
+                ).pdf(d_time - time)
+                likelihood *= alternative_history.calculate_change_likelihood(
+                    d_time, d_node, d_value, copy_rate_matrix, mutation_rate, nlang
+                )
+            yield value, likelihood
+        some_trivial_value = trivial_values.pop()
+        likelihood = 1.0
+        alternative_history._states[time_slice, node] = some_trivial_value
+        for d_time, d_node, d_value in dependent_changes:
+            likelihood *= alternative_history.calculate_change_likelihood(
+                d_time, d_node, d_value, copy_rate_matrix, mutation_rate, nlang
+            )
+        yield some_trivial_value, likelihood
+        for value in trivial_values:
+            yield value, likelihood
+
+
+import pytest
+
+
+@pytest.fixture(
+    params=[
+        (numpy.zeros(5, dtype=int), [], 1.0),
+        (numpy.zeros(5, dtype=int), [(0.5, 0, 1)], 1.0),
+        (numpy.zeros(5, dtype=int), [(0.5, 0, 1), (0.6, 1, 2)], 1.0),
+        (numpy.zeros(5, dtype=int), [(0.1, 0, 1), (0.2, 1, 1), (0.3, 2, 1)], 1.0),
+        (
+            numpy.zeros(5, dtype=int),
+            [(0.1, 0, 1), (0.2, 1, 1), (0.3, 2, 1), (0.4, 0, 0)],
+            1.0,
+        ),
+    ]
+)
+def history5(request):
+    return History(*request.param)
+
+
+@pytest.fixture()
+def ratematrix5():
+    return numpy.ones((5, 5))
+
+
+@pytest.fixture(params=[0.5])
+def mu5(request):
+    return request.param
+
+
+@pytest.fixture(params=[6, 2])
+def nlang5(request):
+    return request.param
+
+
+def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
+    """Test that local likelihoods add up.
+
+    Test that the conditional probabilities of events, given that an event
+    happens at a specific time, add up to 1, and that the probabilites of changes,
+    given that a change happens at a specific time, also add up to 1.
+
+    Check that these two probabilities are proportional to each other, and that
+    the proportionality factor is exactly given by the likelihood of seeing a
+    change given an event.
+
+    """
+    for time, node, value in history5.all_changes():
+        p_cond = numpy.zeros((len(history5.start()), nlang5))
+        p_raw = numpy.zeros((len(history5.start()), nlang5))
+        for potential_node in range(len(history5.start())):
+            for alternative in range(nlang5):
+                p_raw[
+                    potential_node, alternative
+                ] = history5.calculate_event_likelihood(
+                    time, potential_node, alternative, ratematrix5, mu5, nlang5
+                )
+                try:
+                    p_cond[
+                        potential_node, alternative
+                    ] = history5.calculate_change_likelihood(
+                        time, potential_node, alternative, ratematrix5, mu5, nlang5
+                    )
+                except ValueError:
+                    continue
+        q = 1 - history5.calculate_no_change_likelihood(time, ratematrix5, mu5, nlang5)
+        assert numpy.allclose(p_raw.sum(), 1)
+        assert numpy.allclose(p_cond.sum(), 1)
+        assert numpy.allclose(numpy.nan_to_num(p_raw / p_cond, q, q, q), q)
+
+
+def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
+    """
+    The probabilites in alternatives_with_likelihood are calculated such that
+
+        exp(h.loglikelihood(...)) / alternatives_with_likelihood(h, node, time ...)
+
+    is constant for all changes (node, time).
+    """
+    history = history5
+    copy_rate_matrix = ratematrix5
+    mutation_rate = mu5
+    nlang = nlang5
+
+    reference = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
+    changes = history.all_changes()
+    for i, (time, node, value) in enumerate(changes):
+        alternatives = list(
+            history.alternatives_with_likelihood(
+                node, time, copy_rate_matrix, mutation_rate, nlang
+            )
+        )
+        # An alternative can be excluded because it is the previous or the next
+        # state of the node; if the previous and next state are identical,
+        # there is only one forbidden state.
+        assert nlang - 2 <= len(alternatives) <= nlang - 1
+        ps = []
+        likelihoods = []
+        for alternative, p in alternatives:
+            try:
+                alternative_history = History(
+                    history.start(),
+                    [
+                        (time, node, value if j != i else alternative)
+                        for j, (time, node, value) in enumerate(changes)
+                    ],
+                    history.end,
+                )
+            except ValueError:
+                continue
+
+            if alternative == value:
+                p0 = p
+
+            likelihoods.append(
+                alternative_history.loglikelihood(
+                    copy_rate_matrix, mutation_rate, nlang
+                )
+            )
+            ps.append(p)
+        assert numpy.allclose(
+            numpy.asarray(ps) / p0, numpy.exp(numpy.asarray(likelihoods) - reference)
         )
 
 
