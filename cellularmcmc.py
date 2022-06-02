@@ -1,8 +1,9 @@
-import numpy
-from copy import deepcopy
-import typing
-import itertools
 import bisect
+import itertools
+import typing
+from copy import deepcopy
+
+import numpy
 from matplotlib import pyplot as plt
 from scipy.stats import expon
 
@@ -66,7 +67,7 @@ class History(typing.Generic[L]):
 
         >>> random_times = numpy.cumsum(numpy.random.random(10))
         >>> random_nodes = numpy.random.randint(3, size=10)
-        >>> random_values = numpy.random.randint(30, size=10)
+        >>> random_values = numpy.random.randint(300, size=10)
         >>> h = History(
         ...   numpy.array([0, 0, 0], int),
         ...   zip(random_times, random_nodes, random_values))
@@ -116,9 +117,9 @@ class History(typing.Generic[L]):
         ...    (0.5, 1, "B")],
         ...    0.6)
         >>> list(h.related(0.05, 0, [1, 2]))
-        [(0.05, 2, 'A'), (0.1, 0, 'C')]
+        [(0.05, 2, 'A')]
         >>> list(h.related(0.15, 0, [1, 2]))
-        [(0.25, 1, 'C'), (0.3, 2, 'B'), (0.4, 0, 'B')]
+        [(0.25, 1, 'C'), (0.3, 2, 'B')]
         >>> list(h.related(0.1, 0, [1, 2])) == _
         True
         >>> list(h.related(0.45, 0, [1, 2]))
@@ -127,12 +128,11 @@ class History(typing.Generic[L]):
         []
 
         NOTE: The changes are returned in node order (as given by
-        `connections`, followed by the subsequent change of `node` itself if
-        there is one), then for each node in time order. To get an overall time
-        order, use `sorted()` etc.
+        `connections`), then for each node in time order. To get an overall
+        time order, use `sorted()` etc.
 
         >>> list(h.related(0.4, 1, [0, 2]))
-        [(0.4, 0, 'B'), (0.3, 2, 'B'), (0.5, 1, 'B')]
+        [(0.4, 0, 'B'), (0.3, 2, 'B')]
 
         """
         time_slice = bisect.bisect(self._times[:, node], time)
@@ -141,6 +141,8 @@ class History(typing.Generic[L]):
             interval = 0.0, self._times[time_slice, node]
         else:
             interval = self._times[time_slice - 1, node], self._times[time_slice, node]
+        if interval[1] == numpy.inf:
+            interval = interval[0], self.end
         for other_node in connections:
             start = bisect.bisect(self._times[:, other_node], interval[0])
             end = bisect.bisect(self._times[:, other_node], interval[1])
@@ -156,11 +158,6 @@ class History(typing.Generic[L]):
                     ]
                 except IndexError:
                     continue
-        try:
-            yield interval[1], node, self._states[time_slice + 1, node]
-        except IndexError:
-            # There is no following change of this node.
-            pass
 
     def at(self, time: float, node: int) -> L:
         """Look up the value of a node at a particular time.
@@ -593,16 +590,27 @@ class History(typing.Generic[L]):
            probability 1/2.
 
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, end=1.0)),
-        ...   numpy.exp(-0.5) * 0.5 * 3*numpy.exp(-1.5) * 0.5)
+        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, start=0.5, end=1.0)),
+        ...   3*numpy.exp(-1.5) * 0.5)
         True
 
          - The probability that in the new homogenous state (B, B) no change
            happens for another 1.0 time units, which has probabilty exp(-1).
 
         >>> numpy.allclose(
+        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, start=1.0)),
+        ...   numpy.exp(-1))
+        True
+        >>> numpy.allclose(
         ...   numpy.exp(h.loglikelihood(matrix, mu, 2)),
         ...   numpy.exp(-0.5) * 0.5 * 3*numpy.exp(-1.5) * 0.5 * numpy.exp(-1))
+        True
+
+        >>> numpy.allclose(
+        ...   h.loglikelihood(matrix, mu, 2, end=0.5) +
+        ...   h.loglikelihood(matrix, mu, 2, start=0.5, end=1.0) +
+        ...   h.loglikelihood(matrix, mu, 2, start=1.0),
+        ...   h.loglikelihood(matrix, mu, 2))
         True
 
         """
@@ -658,19 +666,23 @@ class History(typing.Generic[L]):
         """
         alternative_history = deepcopy(self)
         time_slice = bisect.bisect(alternative_history._times[:, node], time)
+        assert time_slice > 0, "Cannot give alternatives for the start value"
         is_neighbor = (copy_rate_matrix[:, node] > 0) | (copy_rate_matrix[node, :] > 0)
         neighbors = numpy.arange(len(is_neighbor))[is_neighbor]
         dependent_changes = list(self.related(time, node, neighbors))
         try:
-            next_time, next_node, next_value = dependent_changes[-1]
-            if next_node != node:
+            next_time = self._times[time_slice, node]
+            if next_time > self.end:
                 raise IndexError
-            dependent_changes.pop()
-            forbidden_values = {self.before(time, node), next_value}
+            forbidden_values = {self._states[time_slice - 1, node], self._states[time_slice + 1, node]}
         except IndexError:
-            # This is the last recorded value of this node in this history.
-            forbidden_values = {self.before(time, node)}
-        nontrivial_values = {v for _, _, v in dependent_changes}
+            next_time = self.end
+            forbidden_values = {self._states[time_slice - 1, node]}
+        nontrivial_values = (
+            {v for _, _, v in dependent_changes}
+            # TODO: Technically, only the incoming neighbors, not the outgoing neighbors.
+            | {self.before(time, neighbor) for neighbor in neighbors}
+        ) - forbidden_values
         dependent_changes.insert(
             0, (time, node, alternative_history._states[time_slice, node])
         )
@@ -679,12 +691,32 @@ class History(typing.Generic[L]):
         # handled the same.
         trivial_values = set(range(nlang)) - nontrivial_values - forbidden_values
 
-        for value in nontrivial_values:
+        some_trivial_value = trivial_values.pop()
+        for value in itertools.chain(nontrivial_values, [some_trivial_value]):
             likelihood = 1.0
             alternative_history._states[time_slice, node] = value
+            loglikelihood = alternative_history.loglikelihood(
+                copy_rate_matrix,
+                mutation_rate,
+                nlang,
+                numpy.nextafter(time, -numpy.inf),
+                next_time,
+            )
+            # There should be a way to compute the likelihood change
+            # considering only the connected nodes. But the adjustment for the
+            # conditional probability that no change happens, given the assumed
+            # state of node, is a bit more difficult than I thought.
             for d_time, d_node, d_value in dependent_changes:
-                # if d_value is the same as value, then the probability of seeing no change in either goes up by the connection strength.
-                # if d_value is different from value, then the probability of seeing no change in either goes down by the connection strength.
+                # if d_value is the same as value, then the probability of
+                # seeing no change in either node or d_node goes up by the
+                # connection strength.
+
+                # if d_value is different from value, then the probability of
+                # seeing no change in either goes down by the connection
+                # strength.
+
+                # But I don't know whether that change has a simple expression
+                # in terms of expon, something like this.
                 likelihood *= expon(
                     scale=1
                     / (copy_rate_matrix[d_node, node] + copy_rate_matrix[node, d_node])
@@ -692,142 +724,10 @@ class History(typing.Generic[L]):
                 likelihood *= alternative_history.calculate_change_likelihood(
                     d_time, d_node, d_value, copy_rate_matrix, mutation_rate, nlang
                 )
-            yield value, likelihood
-        some_trivial_value = trivial_values.pop()
-        likelihood = 1.0
-        alternative_history._states[time_slice, node] = some_trivial_value
-        for d_time, d_node, d_value in dependent_changes:
-            likelihood *= alternative_history.calculate_change_likelihood(
-                d_time, d_node, d_value, copy_rate_matrix, mutation_rate, nlang
-            )
-        yield some_trivial_value, likelihood
+            yield value, numpy.exp(loglikelihood)
         for value in trivial_values:
-            yield value, likelihood
+            yield value, numpy.exp(loglikelihood)
 
-
-import pytest
-
-
-@pytest.fixture(
-    params=[
-        (numpy.zeros(5, dtype=int), [], 1.0),
-        (numpy.zeros(5, dtype=int), [(0.5, 0, 1)], 1.0),
-        (numpy.zeros(5, dtype=int), [(0.5, 0, 1), (0.6, 1, 2)], 1.0),
-        (numpy.zeros(5, dtype=int), [(0.1, 0, 1), (0.2, 1, 1), (0.3, 2, 1)], 1.0),
-        (
-            numpy.zeros(5, dtype=int),
-            [(0.1, 0, 1), (0.2, 1, 1), (0.3, 2, 1), (0.4, 0, 0)],
-            1.0,
-        ),
-    ]
-)
-def history5(request):
-    return History(*request.param)
-
-
-@pytest.fixture()
-def ratematrix5():
-    return numpy.ones((5, 5))
-
-
-@pytest.fixture(params=[0.5])
-def mu5(request):
-    return request.param
-
-
-@pytest.fixture(params=[6, 2])
-def nlang5(request):
-    return request.param
-
-
-def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
-    """Test that local likelihoods add up.
-
-    Test that the conditional probabilities of events, given that an event
-    happens at a specific time, add up to 1, and that the probabilites of changes,
-    given that a change happens at a specific time, also add up to 1.
-
-    Check that these two probabilities are proportional to each other, and that
-    the proportionality factor is exactly given by the likelihood of seeing a
-    change given an event.
-
-    """
-    for time, node, value in history5.all_changes():
-        p_cond = numpy.zeros((len(history5.start()), nlang5))
-        p_raw = numpy.zeros((len(history5.start()), nlang5))
-        for potential_node in range(len(history5.start())):
-            for alternative in range(nlang5):
-                p_raw[
-                    potential_node, alternative
-                ] = history5.calculate_event_likelihood(
-                    time, potential_node, alternative, ratematrix5, mu5, nlang5
-                )
-                try:
-                    p_cond[
-                        potential_node, alternative
-                    ] = history5.calculate_change_likelihood(
-                        time, potential_node, alternative, ratematrix5, mu5, nlang5
-                    )
-                except ValueError:
-                    continue
-        q = 1 - history5.calculate_no_change_likelihood(time, ratematrix5, mu5, nlang5)
-        assert numpy.allclose(p_raw.sum(), 1)
-        assert numpy.allclose(p_cond.sum(), 1)
-        assert numpy.allclose(numpy.nan_to_num(p_raw / p_cond, q, q, q), q)
-
-
-def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
-    """
-    The probabilites in alternatives_with_likelihood are calculated such that
-
-        exp(h.loglikelihood(...)) / alternatives_with_likelihood(h, node, time ...)
-
-    is constant for all changes (node, time).
-    """
-    history = history5
-    copy_rate_matrix = ratematrix5
-    mutation_rate = mu5
-    nlang = nlang5
-
-    reference = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
-    changes = history.all_changes()
-    for i, (time, node, value) in enumerate(changes):
-        alternatives = list(
-            history.alternatives_with_likelihood(
-                node, time, copy_rate_matrix, mutation_rate, nlang
-            )
-        )
-        # An alternative can be excluded because it is the previous or the next
-        # state of the node; if the previous and next state are identical,
-        # there is only one forbidden state.
-        assert nlang - 2 <= len(alternatives) <= nlang - 1
-        ps = []
-        likelihoods = []
-        for alternative, p in alternatives:
-            try:
-                alternative_history = History(
-                    history.start(),
-                    [
-                        (time, node, value if j != i else alternative)
-                        for j, (time, node, value) in enumerate(changes)
-                    ],
-                    history.end,
-                )
-            except ValueError:
-                continue
-
-            if alternative == value:
-                p0 = p
-
-            likelihoods.append(
-                alternative_history.loglikelihood(
-                    copy_rate_matrix, mutation_rate, nlang
-                )
-            )
-            ps.append(p)
-        assert numpy.allclose(
-            numpy.asarray(ps) / p0, numpy.exp(numpy.asarray(likelihoods) - reference)
-        )
 
 
 # GOALS:
