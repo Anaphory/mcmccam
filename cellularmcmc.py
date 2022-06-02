@@ -651,8 +651,8 @@ class History(typing.Generic[L]):
 
     def alternatives_with_likelihood(
         self,
-        node: int,
         time: float,
+        node: int,
         copy_rate_matrix: numpy.ndarray,
         mutation_rate: float,
         nlang: int,
@@ -666,26 +666,27 @@ class History(typing.Generic[L]):
         """
         alternative_history = deepcopy(self)
         time_slice = bisect.bisect(alternative_history._times[:, node], time)
-        assert time_slice > 0, "Cannot give alternatives for the start value"
         is_neighbor = (copy_rate_matrix[:, node] > 0) | (copy_rate_matrix[node, :] > 0)
         neighbors = numpy.arange(len(is_neighbor))[is_neighbor]
         dependent_changes = list(self.related(time, node, neighbors))
+        forbidden_values = set()
         try:
             next_time = self._times[time_slice, node]
             if next_time > self.end:
                 raise IndexError
-            forbidden_values = {self._states[time_slice - 1, node], self._states[time_slice + 1, node]}
+            forbidden_values.add(
+                self._states[time_slice + 1, node],
+            )
         except IndexError:
             next_time = self.end
-            forbidden_values = {self._states[time_slice - 1, node]}
+        if time_slice > 0:
+            forbidden_values.add(self._states[time_slice - 1, node])
         nontrivial_values = (
             {v for _, _, v in dependent_changes}
-            # TODO: Technically, only the incoming neighbors, not the outgoing neighbors.
+            # TODO: Technically, only the incoming neighbors are relevant
+            # ‘before’, not the outgoing neighbors.
             | {self.before(time, neighbor) for neighbor in neighbors}
         ) - forbidden_values
-        dependent_changes.insert(
-            0, (time, node, alternative_history._states[time_slice, node])
-        )
         # Well, that's a lie. The ‘trivial’ values are not exactly trivial to
         # compute. But they all have the same likelihood, so they can all be
         # handled the same.
@@ -729,110 +730,318 @@ class History(typing.Generic[L]):
             yield value, numpy.exp(loglikelihood)
 
 
-
 # GOALS:
-# (a) A Gibbs operator that changes the value intervall between two subsequent changes of one node, based on all changes on adjacent nodes that interact with this change [ie. all that have either the old or the new value]
 # (b) A Gibbs operator that changes the position of a change between the change before and the change after. This includes creating a change, from sliding it in from before the start/after the endof the observed interval, or deleting a change, from sliding it out of the observed interval.
 # (c) A pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
 
 
-def add_pair_of_changes(history):
-    ...
+def gibbs_redraw_change(history, change=None):
+    """A Gibbs operator changing the value of a change.
+
+    A Gibbs operator that changes the value on the interval between two
+    subsequent changes of one node, based on all changes on adjacent nodes that
+    interact with this change.
+
+    """
+    changes = history.all_changes()
+    if change is None:
+        try:
+            change = numpy.random.randint(len(changes))
+        except ValueError:
+            return -numpy.inf, None
+    time, node, value = changes[change]
+    sump = 0.0
+    probabilities = []
+    values = []
+    for alternative, probability in history.alternatives_with_likelihood(
+        time,
+        node,
+        copy_rate_matrix,
+        mutation_rate,
+        nlang,
+    ):
+        sump += probability
+        probabilities.append(sump)
+        values.append(alternative)
+    new_value = values[bisect.bisect(probabilities, numpy.random.random() * sump)]
+    if new_value == value:
+        return numpy.inf, history
+    else:
+        return numpy.inf, History(
+            history.start(),
+            [
+                (t, n, v if j != change else new_value)
+                for j, (t, n, v) in enumerate(history.all_changes())
+            ],
+            history.end,
+        )
+
+
+def gibbs_redraw_start(history, node=None):
+    """A Gibbs operator changing the value of a change.
+
+    A Gibbs operator that changes the value on the interval between two
+    subsequent changes of one node, based on all changes on adjacent nodes that
+    interact with this change.
+
+    """
+    start = list(history.start())
+    if node is None:
+        node = numpy.random.randint(len(start))
+    value = start[node]
+    sump = 0.0
+    probabilities = []
+    values = []
+    for alternative, probability in history.alternatives_with_likelihood(
+        0.0,
+        node,
+        copy_rate_matrix,
+        mutation_rate,
+        nlang,
+    ):
+        sump += probability
+        probabilities.append(sump)
+        values.append(alternative)
+    new_value = values[bisect.bisect(probabilities, numpy.random.random() * sump)]
+    if new_value == value:
+        return numpy.inf, history
+    else:
+        start[node] = new_value
+        return numpy.inf, History(
+            start,
+            history.all_changes(),
+            history.end,
+        )
+
+
+def move_change(history):
+    random_node = numpy.random.randint(len(history.start()))
+    actual_changes = (history._times[:, random_node] < history.end).sum()
+    try:
+        random_change = numpy.random.randint(1, actual_changes)
+    except ValueError:
+        return -numpy.inf, history
+    lower = history._times[random_change - 1, random_node]
+    try:
+        upper = history._times[random_change + 1, random_node]
+    except IndexError:
+        upper = history.end
+    if upper > history.end:
+        upper = history.end
+    alternative_history = deepcopy(history)
+    alternative_history._times[random_change, random_node] = numpy.random.uniform(
+        lower, upper
+    )
+    return 0.0, alternative_history
 
 
 def split_change(history):
-    ...
+    # Pick a random change
+    random_node = numpy.random.randint(len(history.start()))
+    actual_changes = (history._times[:, random_node] < history.end).sum()
+    if actual_changes == 0:
+        print("Case A")
+        lower = numpy.random.uniform(-expon().rvs(), 0)
+        upper = numpy.random.uniform(history.end, history.end + expon().rvs())
+        mid = numpy.random.uniform(lower, upper - history.end)
+        if mid > 0:
+            mid += history.end
+            value_of_second_change = numpy.random.randint(nlang)
+        else:
+            value_of_second_change = history._states[0, random_node]
+    else:
+        random_change = numpy.random.randint(0, actual_changes + 1)
+        if random_change == 0:
+            print("Case B")
+            # Split the change before the start of history, potentially moving it into the history.
+            lower = numpy.random.uniform(-expon().rvs(), 0)
+            lower = numpy.random.uniform(-expon().rvs(), 0)
+            upper = history._times[random_change + 1, random_node]
+            if upper > history.end:
+                upper = numpy.random.uniform(history.end, history.end + expon().rvs())
+            mid = numpy.random.uniform(lower, 0.0)
+            value_of_second_change = history._states[0, random_node]
+        elif random_change == actual_changes:
+            print("Case C")
+            # Split the change after the end of history, potentially adding the new change before the end.
+            lower = history._times[random_change - 1, random_node]
+            upper = numpy.random.uniform(history.end, history.end + expon().rvs())
+            mid = numpy.random.uniform(history.end, upper)
+            value_of_second_change = history.at(history.end, random_node)
+        else:
+            print("Case D")
+            lower = history._times[random_change - 1, random_node]
+            upper = history._times[random_change + 1, random_node]
+            if upper > history.end:
+                upper = numpy.random.uniform(history.end, history.end + expon().rvs())
+            mid = history._times[random_change, random_node]
+            value_of_second_change = history._states[random_change + 1, random_node]
+
+    new_change_time = numpy.random.uniform(lower, mid)
+    move_existing_change_to = numpy.random.uniform(mid, upper)
+    if move_existing_change_to <= 0.0:
+        # The old change was before history, and the second of the new changes
+        # is also before history. History doesn't change.
+        return 0.0, history
+    elif move_existing_change_to > history.end:
+        if new_change_time > history.end:
+            # The new change is outside history, so the moved old change even
+            # more so. History doesn't change.
+            return 0.0, history
+        if new_change_time <= 0.0:
+            # Both the change before and the change after are on different ends
+            # of history, so change the value of the node – completely
+            # throughout history – at random
+            _, alternative_history = gibbs_redraw_start(history, node=random_node)
+            return 0.0, alternative_history
+        else:
+            # Add a new change at the end
+            changes = history.all_changes()
+            new_change_pos = bisect.bisect(changes, (new_change_time, random_node, -1))
+            changes.insert(new_change_pos, (new_change_time, random_node, -1))
+            alternative_history = History(history.start(), changes, history.end)
+            _, alternative_history = gibbs_redraw_change(
+                alternative_history, change=new_change_pos
+            )
+            return 0.0, alternative_history
+    else:
+        # The second change is inside history.
+        if new_change_time <= 0.0:
+            # Add the new change before the start, i.e. change the starting value and the position of the first change.
+            alternative_history = deepcopy(history)
+            new_value = numpy.random.randint(nlang - 1)
+            if new_value >= value_of_second_change:
+                new_value += 1
+            alternative_history._states[0, random_node] = new_value
+            alternative_history._times[0, random_node] = move_existing_change_to
+            return 0.0, alternative_history
+        else:
+            # The normal case: The new change and the moved change are both within the history.
+            changes = [
+                (t, n, v)
+                for t, n, v in history.all_changes()
+                if t != mid or n != random_node or v != value_of_second_change
+            ]
+            new_change_pos = bisect.bisect(changes, (new_change_time, random_node, 0))
+            changes.insert(new_change_pos, (new_change_time, random_node, -1))
+            moved_change_pos = bisect.bisect(
+                changes, (move_existing_change_to, random_node, value_of_second_change)
+            )
+            changes.insert(
+                moved_change_pos,
+                (move_existing_change_to, random_node, value_of_second_change),
+            )
+
+            alternative_history = History(history.start(), changes, history.end)
+            _, alternative_history = gibbs_redraw_change(
+                alternative_history, change=new_change_pos
+            )
+            return 0.0, alternative_history
 
 
 def merge_changes(history):
-    ...
+    # Pick a pair of subsequent random changes (which can lie outside the history)
+    random_node = numpy.random.randint(len(history.start()))
+    actual_changes = (history._times[:, random_node] < history.end).sum()
+    if actual_changes < 2:
+        return -numpy.inf, history
+    if actual_changes == 2:
+        random_change = 1
+    else:
+        random_change = numpy.random.randint(1, actual_changes - 1)
+    t0, t1 = history._times[random_change : random_change + 2, random_node]
+    if t1 > history.end:
+        t1 = numpy.random.uniform(history.end, history.end + expon().rvs())
+    value = history._states[random_change + 1, random_node]
+    changes = [
+        (t, n, v)
+        for t, n, v in history.all_changes()
+        if (t != t0 and t != t1) or n != random_node
+    ]
+    tmid = (t0 + t1) / 2
+    if tmid < history.end:
+        new_change_pos = bisect.bisect(changes, (tmid, random_node, value))
+        changes.insert(new_change_pos, (tmid, random_node, value))
+
+    return 0.0, History(history.start(), changes, history.end)
 
 
-def gibbs_redraw_change(history: History):
-    all_changes = history.all_changes()
-    time, node, value = all_changes[numpy.random.randint(len(all_changes))]
-    cump = 0
-    for i in range(nlang):
-        try:
-            p_i = history.calculate_change_likelihood(node, i, time, matrix, mu, nlang)
-        except ValueError:
-            p_i = 0.0
-        # FIXME missing: how does this affect subsequent changes?
-        cump.append(p_i + cump[-1])
-    new_value = bisect.bisect(cump[1:], numpy.random.random())
-
-
-def slide_change(history):
-    ...
-
-
-def redraw_change(history: History):
-    ...
+def add_or_remove_change(history):
+    if numpy.random.randint(2):
+        return split_change(history)
+    else:
+        return merge_changes(history)
 
 
 def select_operator():
-    ...
+    return [add_or_remove_change, move_change, gibbs_redraw_change, gibbs_redraw_start][
+        numpy.random.randint(4)
+    ]
 
 
-if __name__ == "__main__":
+if True:
     end = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
-    end_time = 1
-    matrix = numpy.diag([1 for _ in end[1:]], 1) + numpy.diag([1 for _ in end[1:]], -1)
+    end_time = 10.0
+    copy_rate_matrix = numpy.diag([1 for _ in end[1:]], 1) + numpy.diag(
+        [1 for _ in end[1:]], -1
+    )
     nlang = 200
-    history = History(end, [])
-    mu = 1e-4
-    log_likelihood = history.loglikelihood(end_time, matrix, mu, nlang)
+    history = History(end, [], end=end_time)
+    mutation_rate = 1e-4
+    log_likelihood = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
     while True:
         operator = select_operator()
-        candidate_history = operator(deepcopy(history))
+        hastings_ratio, candidate_history = operator(deepcopy(history))
+        if hastings_ratio == -numpy.inf:
+            continue
         candidate_log_likelihood = candidate_history.loglikelihood(
-            end_time, matrix, mu, nlang
+            copy_rate_matrix, mutation_rate, nlang
         )
-        if candidate_log_likelihood > log_likelihood:
+        logp = candidate_log_likelihood + hastings_ratio - log_likelihood
+        if (logp > 0) or (numpy.random.random() < numpy.exp(logp)):
+            print(operator.__name__, "accepted")
             history = candidate_history
+            print(history)
         else:
-            p = numpy.exp(candidate_log_likelihood - log_likelihood)
-            if numpy.random.random() < p:
-                history = candidate_history
+            print(operator.__name__, "rejected")
 
-    if __name__ == "__main__":
-        start = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
+    start = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
 
-        copy_rate_matrix = numpy.diag([1 for _ in start[1:]], 1) + numpy.diag(
-            [1 for _ in start[1:]], -1
-        )
-        mutation_rate = 1e-3
+    copy_rate_matrix = numpy.diag([1 for _ in start[1:]], 1) + numpy.diag(
+        [1 for _ in start[1:]], -1
+    )
+    mutation_rate = 1e-3
 
-        image = start.copy()[None, :]
+    image = start.copy()[None, :]
 
-        NLANG = 200
+    NLANG = 200
 
-        def generate_history(start, end_time, rate_matrix):
-            time = 0
-            ps = numpy.cumsum(rate_matrix.flat)
-            total_rate = ps[-1] + mutation_rate * len(start)
+    def generate_history(start, end_time, rate_matrix):
+        time = 0
+        ps = numpy.cumsum(rate_matrix.flat)
+        total_rate = ps[-1] + mutation_rate * len(start)
+        time += numpy.random.exponential(1 / total_rate)
+        while time < end_time:
+            try:
+                x = numpy.random.random() * total_rate
+                edgefrom, edgeto = numpy.unravel_index(
+                    bisect.bisect(ps, x), rate_matrix.shape
+                )
+                if start[edgeto] == start[edgefrom]:
+                    continue
+                start[edgeto] = start[edgefrom]
+            except ValueError:
+                lang = numpy.random.randint(NLANG)
+                edgeto = numpy.random.randint(len(start))
+                if start[edgeto] == lang:
+                    continue
+                start[edgeto] = lang
+
+            yield time, edgeto, start[edgeto]
             time += numpy.random.exponential(1 / total_rate)
-            while time < end_time:
-                try:
-                    x = numpy.random.random() * total_rate
-                    edgefrom, edgeto = numpy.unravel_index(
-                        bisect.bisect(ps, x), rate_matrix.shape
-                    )
-                    if start[edgeto] == start[edgefrom]:
-                        continue
-                    start[edgeto] = start[edgefrom]
-                except ValueError:
-                    lang = numpy.random.randint(NLANG)
-                    edgeto = numpy.random.randint(len(start))
-                    if start[edgeto] == lang:
-                        continue
-                    start[edgeto] = lang
 
-                yield time, edgeto, start[edgeto]
-                time += numpy.random.exponential(1 / total_rate)
+    for i in generate_history(start, 100, copy_rate_matrix):
+        image = numpy.vstack((image, start[None, :]))
 
-        for i in generate_history(start, 100, copy_rate_matrix):
-            image = numpy.vstack((image, start[None, :]))
-
-        plt.imshow(image.T, aspect="auto", interpolation="nearest")
-        plt.show()
+    plt.imshow(image.T, aspect="auto", interpolation="nearest")
+    plt.show()

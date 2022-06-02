@@ -90,7 +90,7 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
     for i, (time, node, value) in enumerate(changes):
         alternatives = list(
             history.alternatives_with_likelihood(
-                node, time, copy_rate_matrix, mutation_rate, nlang
+                time, node, copy_rate_matrix, mutation_rate, nlang
             )
         )
         # An alternative can be excluded because it is the previous or the next
