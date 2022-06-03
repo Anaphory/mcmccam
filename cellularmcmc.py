@@ -1107,8 +1107,7 @@ def select_operator():
     return all_operators[numpy.random.randint(len(all_operators))]
 
 
-# if __name__ == "__main__":
-if True:
+if __name__ == "__main__":
     end = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
     end_time = 100.0
     copy_rate_matrix = numpy.diag([1 for _ in end[1:]], 1) + numpy.diag(
