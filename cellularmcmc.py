@@ -1,4 +1,5 @@
 import bisect
+from dataclasses import dataclass
 import itertools
 import typing
 from copy import deepcopy
@@ -63,6 +64,13 @@ class History(typing.Generic[L]):
             raise ValueError("End time before the last event.")
         self.end = end
 
+    def __eq__(self, o):
+        valid = numpy.isfinite(self._times)
+        o_valid = numpy.isfinite(o._times)
+        return (self._states[valid] == o._states[o_valid]).all() and (
+            self._times[valid] == o._times[o_valid]
+        ).all()
+
     def __repr__(self):
         return f"History({self.start()!r}, {self.all_changes()}, {self.end})"
 
@@ -74,7 +82,7 @@ class History(typing.Generic[L]):
 
         >>> random_times = numpy.cumsum(numpy.random.random(10))
         >>> random_nodes = numpy.random.randint(3, size=10)
-        >>> random_values = numpy.random.randint(300, size=10)
+        >>> random_values = numpy.arange(1, 10+1)
         >>> h = History(
         ...   numpy.array([0, 0, 0], int),
         ...   zip(random_times, random_nodes, random_values))
@@ -166,6 +174,40 @@ class History(typing.Generic[L]):
                 except IndexError:
                     continue
 
+    def after(self, time: float, node: int) -> typing.Optional[L]:
+        """Look up the next value a node will take at a particular time.
+
+        Examples
+        ========
+
+        >>> h = History(
+        ...   numpy.array(["A", "A"], dtype="<U1"),
+        ...   [(0.1, 0, "C"), (0.25, 1, "C"), (0.4, 0, "B")])
+
+        >>> h.after(0.0, 0)
+        'C'
+        >>> h.after(0.0, 1)
+        'C'
+        >>> h.after(0.3, 0)
+        'B'
+        >>> h.after(0.3, 1)
+        >>> h.after(0.25, 1)
+        >>> h.after(999., 0)
+        >>> h.after(999., 1)
+        >>> h.after(-999., 0)
+        'A'
+        >>> h.after(-999., 1)
+        'A'
+        """
+        time_slice = bisect.bisect_right(self._times[:, node], time) - 1
+        try:
+            if self._times[time_slice + 1, node] > self.end:
+                return None
+        except IndexError:
+            return None
+        return self._states[time_slice + 1, node]
+
+
     def at(self, time: float, node: int) -> L:
         """Look up the value of a node at a particular time.
 
@@ -250,14 +292,26 @@ class History(typing.Generic[L]):
             time_slice = 0
         return self._states[time_slice, node]
 
+
+@dataclass
+class HistoryModel:
+    """A stochastic model of history."""
+
+    copy_rate_matrix: numpy.ndarray
+    mutation_rate: float
+    languages: typing.Sequence[L]
+
+    @property
+    def nlang(self):
+        """Derive the number of languages."""
+        return len(self.languages)
+
     def calculate_event_likelihood(
         self,
+        history: History[L],
         time: float,
         node: int,
         new_state: L,
-        copy_rate_matrix: numpy.ndarray,
-        mutation_rate: float,
-        nlang: int,
     ):
         """Calculate the likelihood of an event at some point in the history.
 
@@ -293,21 +347,22 @@ class History(typing.Generic[L]):
 
         Assume no mutations, and also assume that no changes have happened yet.
 
-        >>> h = History(start, [])
+        >>> h = History(start, [], end=1.0)
+        >>> m = HistoryModel(matrix, 0.0, range(nlang))
 
         If the first change is at time 0.2, it will have equal probability of
         changing node 0 to B (copied from node 1) or C (copied from node 2);
         changing node 1 to A or C, or changing node 2 to A or B – so each has
         probability 1/6.
 
-        >>> h.calculate_event_likelihood(0.2, 0, "B", matrix, 0.0, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "B")
         0.16666666666666666
-        >>> h.calculate_event_likelihood(0.2, 1, "A", matrix, 0.0, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 1, "A")
         0.16666666666666666
 
         No other change has positive probability.
         >>> for i in "A", "D", "E":
-        ...   print(h.calculate_event_likelihood(0.2, 0, "D", matrix, 0.0, 5))
+        ...   print(m.calculate_event_likelihood(h, 0.2, 0, "D"))
         0.0
         0.0
         0.0
@@ -318,7 +373,7 @@ class History(typing.Generic[L]):
         Assume the same example as above, but now assume that mutations happen
         with half the rate of anything being copied.
 
-        >>> mu = 0.5
+        >>> m.mutation_rate = 0.5
 
         Then each of the three nodes still has the same probability of being
         the target of a change (1/3), but each copying is twice as likely as a
@@ -330,26 +385,29 @@ class History(typing.Generic[L]):
         So the probability of a change to A, D, or E is 1/(25*3), whereas a
         change to B or C happens in 2/(5*3) + 1/(25*3) of cases.
 
-        >>> h.calculate_event_likelihood(0.2, 0, "B", matrix, mu, 5)
+        >>> m.languages = range(5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "B")
         0.14666666666666667
-        >>> h.calculate_event_likelihood(0.2, 0, "C", matrix, mu, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "C")
         0.14666666666666667
-        >>> h.calculate_event_likelihood(0.2, 0, "A", matrix, mu, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "A")
         0.013333333333333332
-        >>> h.calculate_event_likelihood(0.2, 0, "D", matrix, mu, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "D")
         0.013333333333333332
-        >>> h.calculate_event_likelihood(0.2, 0, "E", matrix, mu, 5)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "E")
         0.013333333333333332
 
         """
-        total_rate = copy_rate_matrix.sum() + mutation_rate * self._states.shape[1]
+        total_rate = (
+            self.copy_rate_matrix.sum() + self.mutation_rate * history._states.shape[1]
+        )
         p_of_choosing_this_node = (
-            copy_rate_matrix.sum(0)[node] + mutation_rate
+            self.copy_rate_matrix.sum(0)[node] + self.mutation_rate
         ) / total_rate
-        odds_state = mutation_rate / nlang
-        total_odds = mutation_rate
-        for edgefrom, p in enumerate(copy_rate_matrix[:, node]):
-            neighbor_state = self.before(time, edgefrom)
+        odds_state = self.mutation_rate / self.nlang
+        total_odds = self.mutation_rate
+        for edgefrom, p in enumerate(self.copy_rate_matrix[:, node]):
+            neighbor_state = history.before(time, edgefrom)
             if neighbor_state == new_state:
                 odds_state += p
             total_odds += p
@@ -357,10 +415,8 @@ class History(typing.Generic[L]):
 
     def calculate_no_change_likelihood(
         self,
+        history: History[L],
         time: float,
-        copy_rate_matrix: numpy.ndarray,
-        mutation_rate: float,
-        nlang: int,
     ):
         """Calculate the probability for non-change event.
 
@@ -383,12 +439,12 @@ class History(typing.Generic[L]):
         >>> nlang = 5
 
         and no history of change yet.
-        >>> h = History(start, [])
-
         Mutations happen with half the rate of
         anything being copied.
 
+        >>> h = History(start, [])
         >>> mu = 0.5
+        >>> m = HistoryModel(matrix, mu, range(nlang))
 
         Then out of the 3*2.5 rate-weighted events, the ones that do not change
         the system are
@@ -396,21 +452,21 @@ class History(typing.Generic[L]):
          - Node 0 copies state A from node 1 (at rate 1),
          - Node 0 mutates to state A randomly (p=1/5 at rate 0.5)
         together at likelihood
-        >>> h.calculate_event_likelihood(0.2, 0, "A", matrix, mu, nlang)
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "A")
         0.14666666666666667
 
          - Node 1 copies state A from node 0 (at rate 1),
          - Node 1 mutates to state A randomly (p=1/5 at rate 0.5)
         together at likelihood
-        >>> h.calculate_event_likelihood(0.2, 1, "A", matrix, mu, nlang)
+        >>> m.calculate_event_likelihood(h, 0.2, 1, "A")
         0.14666666666666667
 
         - Node 2 mutates to state B randomly (p=1/5 at rate 0.5)
-        >>> h.calculate_event_likelihood(0.2, 2, "B", matrix, mu, nlang)
+        >>> m.calculate_event_likelihood(h, 0.2, 2, "B")
         0.013333333333333332
 
         Together, this is a likelihood of
-        >>> h.calculate_no_change_likelihood(0.2, matrix, mu, nlang)
+        >>> m.calculate_no_change_likelihood(h, 0.2)
         0.30666666666666664
 
         For two connected nodes with identical values, the only way of change
@@ -418,27 +474,30 @@ class History(typing.Generic[L]):
         observable with probability 1/2. If mutation happens at the same rate
         as copying, the probability of an actual change is 1/4.
 
-        >>> History(["A", "A"], []).calculate_no_change_likelihood(
-        ...   0.5, numpy.array([[0,1],[1,0]]), 1, 2)
+        >>> HistoryModel(
+        ...   numpy.array([[0,1],[1,0]]), 1, ["A", "B"]
+        ...   ).calculate_no_change_likelihood(
+        ...     History(["A", "A"], []), 0.5)
         0.75
 
         """
         p = 0
-        for node in range(self._states.shape[1]):
-            state_before = self.before(time, node)
+        for node in range(history._states.shape[1]):
+            state_before = history.before(time, node)
             p += self.calculate_event_likelihood(
-                time, node, state_before, copy_rate_matrix, mutation_rate, nlang
+                history,
+                time,
+                node,
+                state_before,
             )
         return p
 
     def calculate_change_likelihood(
         self,
+        history: History[L],
         time: float,
         node: int,
         new_state: L,
-        copy_rate_matrix: numpy.ndarray,
-        mutation_rate: float,
-        nlang: int,
     ):
         """Calculate the likelihood of a change at some point in the history.
 
@@ -480,11 +539,12 @@ class History(typing.Generic[L]):
         Mutations happen with half the rate of anything being copied.
 
         >>> mu = 0.5
+        >>> m = HistoryModel(matrix, mu, range(nlang))
 
         Then a first event (let us assume at time 0.2) that sets the new value
         of node 0 to A is no change.
 
-        >>> h.calculate_change_likelihood(0.2, 0, "A", matrix, mu, nlang)
+        >>> m.calculate_change_likelihood(h, 0.2, 0, "A")
         Traceback (most recent call last):
           ...
         ValueError: Event is no change
@@ -494,9 +554,9 @@ class History(typing.Generic[L]):
         addition, 4 out of 5 mutation events for each node are observable, each
         with equal probability (rate 0.1 each). So node 2 gaining state A has a
         probability of (2+0.1)/(2+2+3*0.4) = 21/52
-        >>> h.calculate_change_likelihood(0.2, 2, "A", matrix, mu, nlang) * 52
+        >>> m.calculate_change_likelihood(h, 0.2, 2, "A") * 52
         20.999999999999996
-        >>> h.calculate_change_likelihood(0.2, 2, "C", matrix, mu, nlang) * 52
+        >>> m.calculate_change_likelihood(h, 0.2, 2, "C") * 52
         0.9999999999999999
 
         All the valid likelihoods obviously add up to 1.
@@ -504,7 +564,7 @@ class History(typing.Generic[L]):
         >>> for node in 0,1,2:
         ...   for state in "A", "B", "C", "D", "E":
         ...     try:
-        ...       p += h.calculate_change_likelihood(0.2, node, state, matrix, mu, nlang)
+        ...       p += m.calculate_change_likelihood(h, 0.2, node, state)
         ...     except ValueError:
         ...       print(node, state)
         ...
@@ -515,19 +575,17 @@ class History(typing.Generic[L]):
         1.0
 
         """
-        if self.before(time, node) == new_state:
+        if history.before(time, node) == new_state:
             raise ValueError("Event is no change")
-        return self.calculate_event_likelihood(
-            time, node, new_state, copy_rate_matrix, mutation_rate, nlang
-        ) / (
-            1
-            - self.calculate_no_change_likelihood(
-                time, copy_rate_matrix, mutation_rate, nlang
-            )
+        return self.calculate_event_likelihood(history, time, node, new_state) / (
+            1 - self.calculate_no_change_likelihood(history, time)
         )
 
     def loglikelihood(
-        self, copy_rate_matrix, mutation_rate, nlang, start=0.0, end=None
+        self,
+        history,
+        start=0.0,
+        end=None,
     ):
         """Calculate the complete likelihood of the history.
 
@@ -535,7 +593,7 @@ class History(typing.Generic[L]):
         >>> start = ["A", "A", "B"]
         >>> nlang = 5
         >>> mu = 0.5
-        >>> h = History(start, [], 1.0)
+        >>> m = HistoryModel(matrix, mu, range(nlang))
 
         With rates adding up to 7.5, of which 5.2 induce change, the
         probability of observing nothing is rather low (but not as low as taken
@@ -550,10 +608,9 @@ class History(typing.Generic[L]):
         so that should be (up to some rounding) the likelihood of still seeing
         an empty history after 1 time unit:
 
-        >>> numpy.exp(h.loglikelihood(matrix, mu, nlang))
-        0.0055165644207607716
+        >>> no_changes = History(start, changes=[], end=1.0)
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(matrix, mu, nlang)),
+        ...   numpy.exp(m.loglikelihood(no_changes)),
         ...   numpy.exp(-5.2)
         ... )
         True
@@ -562,7 +619,8 @@ class History(typing.Generic[L]):
         happen, the likelihood of nothing observable happening any more is 1.0.
 
         >>> constant = History(["A", "A", "A"], [], 1.0)
-        >>> numpy.exp(constant.loglikelihood(matrix, 0.0, 100))
+        >>> m = HistoryModel(matrix, 0.0, range(100))
+        >>> numpy.exp(m.loglikelihood(constant))
         1.0
 
         If there are events, their likelihood is included. Consider a simple
@@ -570,6 +628,7 @@ class History(typing.Generic[L]):
 
         >>> matrix = numpy.array([[0, 1], [1, 0]])
         >>> mu = 1
+        >>> m = HistoryModel(matrix, mu, [0, 1])
         >>> h = History(["A", "A"], [(0.5, 0, "B"), (1.0, 1, "B")], end=2.0)
 
         The probability to see this history is composed of
@@ -584,10 +643,10 @@ class History(typing.Generic[L]):
            1 flips to B, which happens at the same rate, so this has
            probability 1/2.
 
-           >>> h.calculate_change_likelihood(0.5, 0, "B", matrix, mu, 2)
+           >>> m.calculate_change_likelihood(h, 0.5, 0, "B")
            0.5
 
-        >>> numpy.exp(h.loglikelihood(matrix, mu, 2, end=0.5)) == numpy.exp(-0.5) * 0.5
+        >>> numpy.exp(m.loglikelihood(h, end=0.5)) == numpy.exp(-0.5) * 0.5
         True
 
          - The probability that the second change happen at t=1.0. Now there
@@ -601,7 +660,7 @@ class History(typing.Generic[L]):
            probability 1/2.
 
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, start=0.5, end=1.0)),
+        ...   numpy.exp(m.loglikelihood(h, start=0.5, end=1.0)),
         ...   3*numpy.exp(-1.5) * 0.5)
         True
 
@@ -609,35 +668,38 @@ class History(typing.Generic[L]):
            happens for another 1.0 time units, which has probabilty exp(-1).
 
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(matrix, mu, 2, start=1.0)),
+        ...   numpy.exp(m.loglikelihood(h, start=1.0)),
         ...   numpy.exp(-1))
         True
         >>> numpy.allclose(
-        ...   numpy.exp(h.loglikelihood(matrix, mu, 2)),
+        ...   numpy.exp(m.loglikelihood(h)),
         ...   numpy.exp(-0.5) * 0.5 * 3*numpy.exp(-1.5) * 0.5 * numpy.exp(-1))
         True
 
         >>> numpy.allclose(
-        ...   h.loglikelihood(matrix, mu, 2, end=0.5) +
-        ...   h.loglikelihood(matrix, mu, 2, start=0.5, end=1.0) +
-        ...   h.loglikelihood(matrix, mu, 2, start=1.0),
-        ...   h.loglikelihood(matrix, mu, 2))
+        ...   m.loglikelihood(h, end=0.5) +
+        ...   m.loglikelihood(h, start=0.5, end=1.0) +
+        ...   m.loglikelihood(h, start=1.0),
+        ...   m.loglikelihood(h))
         True
 
         """
         if end is None:
-            end = self.end
+            end = history.end
         prev_time = start
         logp = 0.0
-        state = self._states[0].copy()
+        state = history._states[0].copy()
         observable_transition = state[None, :] != state[:, None]
         mutation_change_rate = (
-            mutation_rate * self._states.shape[1] * (nlang - 1) / nlang
+            self.mutation_rate
+            * history._states.shape[1]
+            * (self.nlang - 1)
+            / self.nlang
         )
         rate_of_observable_change = (
-            copy_rate_matrix * observable_transition
+            self.copy_rate_matrix * observable_transition
         ).sum() + mutation_change_rate
-        for time, node, value in self.all_changes():
+        for time, node, value in history.all_changes():
             if time > end:
                 break
             # Contribution from waiting time
@@ -646,7 +708,10 @@ class History(typing.Generic[L]):
                     time - prev_time
                 ) + numpy.log(
                     self.calculate_change_likelihood(
-                        time, node, value, copy_rate_matrix, mutation_rate, nlang
+                        history,
+                        time,
+                        node,
+                        value,
                     )
                 )
                 prev_time = time
@@ -656,17 +721,15 @@ class History(typing.Generic[L]):
             observable_transition[node, :] = state != value
             observable_transition[:, node] = state != value
             rate_of_observable_change = (
-                copy_rate_matrix * observable_transition
+                self.copy_rate_matrix * observable_transition
             ).sum() + mutation_change_rate
         return logp + expon(scale=1 / rate_of_observable_change).logsf(end - prev_time)
 
     def alternatives_with_likelihood(
         self,
+        history: History[L],
         time: float,
         node: int,
-        copy_rate_matrix: numpy.ndarray,
-        mutation_rate: float,
-        nlang: int,
     ) -> typing.Iterable[tuple[int, float]]:
         """Calculate the possible alternatives for the specified change.
 
@@ -675,42 +738,43 @@ class History(typing.Generic[L]):
         history.
 
         """
-        alternative_history = deepcopy(self)
+        alternative_history = deepcopy(history)
         time_slice = bisect.bisect_right(alternative_history._times[:, node], time) - 1
-        is_neighbor = (copy_rate_matrix[:, node] > 0) | (copy_rate_matrix[node, :] > 0)
+        is_neighbor = (self.copy_rate_matrix[:, node] > 0) | (self.copy_rate_matrix[node, :] > 0)
         neighbors = numpy.arange(len(is_neighbor))[is_neighbor]
-        dependent_changes = list(self.related(time, node, neighbors))
+        dependent_changes = list(history.related(time, node, neighbors))
         forbidden_values = set()
         try:
-            next_time = self._times[time_slice + 1, node]
-            if next_time > self.end:
+            next_time = history._times[time_slice + 1, node]
+            if next_time > history.end:
                 raise IndexError
             forbidden_values.add(
-                self._states[time_slice + 1, node],
+                history._states[time_slice + 1, node],
             )
         except IndexError:
-            next_time = self.end
+            next_time = history.end
         if time_slice > 0:
-            forbidden_values.add(self._states[time_slice - 1, node])
+            forbidden_values.add(history._states[time_slice - 1, node])
         nontrivial_values = (
             {v for _, _, v in dependent_changes}
             # TODO: Technically, only the incoming neighbors are relevant
             # ‘before’, not the outgoing neighbors.
-            | {self.before(time, neighbor) for neighbor in neighbors}
+            | {history.before(time, neighbor) for neighbor in neighbors}
         ) - forbidden_values
         # Well, that's a lie. The ‘trivial’ values are not exactly trivial to
         # compute. But they all have the same likelihood, so they can all be
         # handled the same.
-        trivial_values = set(range(nlang)) - nontrivial_values - forbidden_values
+        trivial_values = set(range(self.nlang)) - nontrivial_values - forbidden_values
 
-        some_trivial_value = trivial_values.pop()
-        for value in itertools.chain(nontrivial_values, [some_trivial_value]):
+        try:
+            some_trivial_value = [trivial_values.pop()]
+        except KeyError:
+            some_trivial_value = []
+        for value in itertools.chain(nontrivial_values, some_trivial_value):
             likelihood = 1.0
             alternative_history._states[time_slice, node] = value
-            loglikelihood = alternative_history.loglikelihood(
-                copy_rate_matrix,
-                mutation_rate,
-                nlang,
+            loglikelihood = self.loglikelihood(
+                alternative_history,
                 numpy.nextafter(time, -numpy.inf),
                 next_time,
             )
@@ -731,22 +795,63 @@ class History(typing.Generic[L]):
                 # in terms of expon, something like this.
                 likelihood *= expon(
                     scale=1
-                    / (copy_rate_matrix[d_node, node] + copy_rate_matrix[node, d_node])
+                    / (self.copy_rate_matrix[d_node, node] + self.copy_rate_matrix[node, d_node])
                 ).pdf(d_time - time)
-                likelihood *= alternative_history.calculate_change_likelihood(
-                    d_time, d_node, d_value, copy_rate_matrix, mutation_rate, nlang
+                likelihood *= self.calculate_change_likelihood(
+                    alternative_history,
+                    d_time,
+                    d_node,
+                    d_value,
                 )
             yield value, numpy.exp(loglikelihood)
         for value in trivial_values:
             yield value, numpy.exp(loglikelihood)
 
+    def generate_history(
+        self,
+        start: typing.Sequence[int],
+        end: float,
+    ) -> History[int]:
+        """Create a new history, according to this model.
 
-# GOALS:
-# (b) A Gibbs operator that changes the position of a change between the change before and the change after. This includes creating a change, from sliding it in from before the start/after the endof the observed interval, or deleting a change, from sliding it out of the observed interval.
-# (c) A pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
+        >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+        >>> mu = 0.5
+        >>> nlang = 5
+        >>> m = HistoryModel(matrix, mu, range(nlang))
+        >>> start = ["A", "A", "B"]
+        >>> h = m.generate_history(start, 100.)
+        >>> m.loglikelihood(h) > -508 or m.loglikelihood(h)
+        True
+
+        """
+        state = deepcopy(start)
+
+        def changes():
+            time = 0
+            ps = numpy.cumsum(self.copy_rate_matrix.flat)
+            total_rate = ps[-1] + self.mutation_rate * len(state)
+            time += expon(scale=1 / total_rate).rvs()
+            while time < end:
+                x = numpy.random.random() * total_rate
+                if x > ps[-1]:
+                    lang = self.languages[numpy.random.randint(self.nlang)]
+                    node = numpy.random.randint(len(state))
+                    if state[node] != lang:
+                        state[node] = lang
+                        yield (time, node, state[node])
+                else:
+                    edgefrom, edgeto = numpy.unravel_index(
+                        bisect.bisect(ps, x), self.copy_rate_matrix.shape
+                    )
+                    if state[edgeto] != state[edgefrom]:
+                        state[edgeto] = state[edgefrom]
+                        yield (time, edgeto, state[edgeto])
+                time += numpy.random.exponential(1 / total_rate)
+
+        return History(start, changes(), end)
 
 
-def gibbs_redraw_change(history, change=None):
+def gibbs_redraw_change(model, history, change=None):
     """A Gibbs operator changing the value of a change.
 
     A Gibbs operator that changes the value on the interval between two
@@ -764,12 +869,10 @@ def gibbs_redraw_change(history, change=None):
     sump = 0.0
     probabilities = []
     values = []
-    for alternative, probability in history.alternatives_with_likelihood(
+    for alternative, probability in model.alternatives_with_likelihood(
+        history,
         time,
         node,
-        copy_rate_matrix,
-        mutation_rate,
-        nlang,
     ):
         sump += probability
         probabilities.append(sump)
@@ -791,7 +894,7 @@ def gibbs_redraw_change(history, change=None):
         )
 
 
-def gibbs_redraw_start(history, node=None):
+def gibbs_redraw_start(model, history, node=None):
     """A Gibbs operator changing the value of a change.
 
     A Gibbs operator that changes the value on the interval between two
@@ -806,12 +909,9 @@ def gibbs_redraw_start(history, node=None):
     sump = 0.0
     probabilities = []
     values = []
-    for alternative, probability in history.alternatives_with_likelihood(
+    for alternative, probability in model.alternatives_with_likelihood(history,
         0.0,
         node,
-        copy_rate_matrix,
-        mutation_rate,
-        nlang,
     ):
         sump += probability
         probabilities.append(sump)
@@ -831,7 +931,7 @@ def gibbs_redraw_start(history, node=None):
         )
 
 
-def move_change(history):
+def move_change(model, history):
     actual_changes = (history._times <= history.end).sum(0) - 1
     heap = actual_changes.cumsum()
     if heap[-1] == 0:
@@ -852,7 +952,9 @@ def move_change(history):
     return 0.0, alternative_history
 
 
-def split_change(history):
+# GOALS:
+# A pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
+def split_change(model, history):
     # Pick a random change, including for each node the one before the start
     # and the one after the end of history
     n_fict_changes = (history._times <= history.end).sum(0) + 1
@@ -866,8 +968,8 @@ def split_change(history):
         if mid > 0:
             mid += history.end
             value_of_second_change = numpy.random.randint(nlang - 1)
-            if value_of_second_change >= history._states[0, random_node]:
-                value_of_second_change += 1
+            if value_of_second_change == history._states[0, random_node]:
+                value_of_second_change = nlang - 1
         else:
             value_of_second_change = history._states[0, random_node]
     else:
@@ -935,8 +1037,8 @@ def split_change(history):
             # Add the new change before the start, i.e. change the starting value and the position of the first change.
             alternative_history = deepcopy(history)
             new_value = numpy.random.randint(nlang - 1)
-            if new_value >= value_of_second_change:
-                new_value += 1
+            if new_value == value_of_second_change:
+                new_value = nlang - 1
             if alternative_history._states[-1, random_node] != numpy.inf:
                 # This node is one of those with the longest history.
                 # To add another change for it, we need to first expand the history array.
@@ -962,8 +1064,8 @@ def split_change(history):
             # Add the new change before the start, i.e. change the starting value and the position of the first change.
             alternative_history = deepcopy(history)
             new_value = numpy.random.randint(nlang - 1)
-            if new_value >= value_of_second_change:
-                new_value += 1
+            if new_value == value_of_second_change:
+                new_value = nlang - 1
             alternative_history._states[0, random_node] = new_value
             alternative_history._states[1, random_node] = value_of_second_change
             alternative_history._times[1, random_node] = move_existing_change_to
@@ -993,7 +1095,7 @@ def split_change(history):
             return 0.0, alternative_history
 
 
-def merge_changes(history):
+def merge_changes(model, history):
     # Pick a pair of subsequent random changes (which can lie outside the history)
     n_fict_changes = (history._times <= history.end).sum(0)
     heap = n_fict_changes.cumsum()
@@ -1054,30 +1156,60 @@ def merge_changes(history):
         return 0.0, history
 
 
-def add_change(history):
+def add_change(model, history):
     pos = numpy.random.uniform(0.0, history.end)
     random_node = numpy.random.randint(len(history.start()))
-    new_value = numpy.random.randint(nlang - 2)
-    if new_value >= history.at(pos, random_node):
-        new_value += 1
+    # FIXME: Add test that new_value also must differ from the next change, if
+    # there is one. Otherwise, subtract only 1.
+    after = history.after(pos, random_node)
+    if after is None:
+        skip = 1
+    else:
+        skip = 2
+    new_value = numpy.random.randint(model.nlang - skip)
+    if new_value == history.at(pos, random_node):
+        new_value = model.nlang - 1
+    if new_value == after:
+        new_value = model.nlang - 2
+        if new_value == history.at(pos, random_node):
+            new_value = model.nlang - 1
     changes = history.all_changes()
     bisect.insort(
-            changes,
-            (pos, random_node, new_value),
-        )
-    try:
-        return numpy.inf, History(history.start(), changes, history.end)
-    except ValueError:
-        return -numpy.inf, history
+        changes,
+        (pos, random_node, new_value),
+    )
+    # FIXME: For the last change added, the subtraction of 1 instead of 2 needs
+    # to be reflected here.
+    return numpy.log(history.end * len(history.start()) * (model.nlang - 2)), History(
+        history.start(), changes, history.end
+    )
 
-def remove_change(history):
+
+def remove_change(model, history):
     # Pick a pair of subsequent random changes
-    n_changes = (history._times <= history.end).sum(0) - 1
+    n_changes = ((history._times <= history.end)).sum(0) - 1
     heap = n_changes.cumsum()
     if heap[-1] == 0:
         return -numpy.inf, history
     random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
     random_change = numpy.random.randint(1, n_changes[random_node] + 1)
+
+    # We cannot remove a change that has the same state before and after its
+    # interval.
+    try:
+        while (
+            history._states[random_change - 1, random_node]
+            == history._states[random_change + 1, random_node]
+        ):
+            # There must be a change back to the starting value after this
+            # change, and that one would be safe to remove, so this loop can
+            # stochastically run very long, but there are bound to be options
+            # that terminate it.
+            random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
+            random_change = numpy.random.randint(1, n_changes[random_node] + 1)
+    except IndexError:
+        # The change is just before the end of the history, so it is safe for remove.
+        pass
 
     changes = history.all_changes()
     changes.remove(
@@ -1087,17 +1219,14 @@ def remove_change(history):
             history._states[random_change, random_node],
         )
     )
-    try:
-        return 0.0, History(history.start(), changes, history.end)
-    except ValueError:
-        return -numpy.inf, history
+    return 0.0, History(history.start(), changes, history.end)
 
 
-def add_or_remove_change(history):
+def add_or_remove_change(model, history):
     if numpy.random.randint(2):
-        return add_change(history)
+        return add_change(model, history)
     else:
-        return remove_change(history)
+        return remove_change(model, history)
 
 
 def select_operator():
@@ -1105,6 +1234,24 @@ def select_operator():
         move_change
     ] * 2
     return all_operators[numpy.random.randint(len(all_operators))]
+
+
+def step_mcmc(model, history, loglikelihood) -> tuple[History, float]:
+    """Execute a single MCMC step"""
+    operator = select_operator()
+    hastings_ratio, candidate_history = operator(model, deepcopy(history))
+    if hastings_ratio == -numpy.inf:
+        print(operator.__name__, "rejected: Impossible")
+        return history, loglikelihood
+    candidate_loglikelihood = model.loglikelihood(candidate_history)
+    logp = candidate_loglikelihood + hastings_ratio - loglikelihood
+    if (logp > 0) or (numpy.random.random() < numpy.exp(logp)):
+        print(operator.__name__, "accepted")
+        history = candidate_history
+        print(history)
+    else:
+        print(operator.__name__, "rejected")
+    return history, candidate_loglikelihood
 
 
 if __name__ == "__main__":
@@ -1116,61 +1263,6 @@ if __name__ == "__main__":
     nlang = 200
     history = History(end, [(50, 10, 2)], end=end_time)
     mutation_rate = 1e-4
-    log_likelihood = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
+    loglikelihood = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
     while True:
-        operator = select_operator()
-        hastings_ratio, candidate_history = operator(deepcopy(history))
-        if hastings_ratio == -numpy.inf:
-            print(operator.__name__, "rejected: Impossible")
-            continue
-        candidate_log_likelihood = candidate_history.loglikelihood(
-            copy_rate_matrix, mutation_rate, nlang
-        )
-        logp = candidate_log_likelihood + hastings_ratio - log_likelihood
-        if (logp > 0) or (numpy.random.random() < numpy.exp(logp)):
-            print(operator.__name__, "accepted")
-            history = candidate_history
-            print(history)
-        else:
-            print(operator.__name__, "rejected")
-
-    start = numpy.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2])
-
-    copy_rate_matrix = numpy.diag([1 for _ in start[1:]], 1) + numpy.diag(
-        [1 for _ in start[1:]], -1
-    )
-    mutation_rate = 1e-3
-
-    image = start.copy()[None, :]
-
-    NLANG = 200
-
-    def generate_history(start, end_time, rate_matrix):
-        time = 0
-        ps = numpy.cumsum(rate_matrix.flat)
-        total_rate = ps[-1] + mutation_rate * len(start)
-        time += numpy.random.exponential(1 / total_rate)
-        while time < end_time:
-            try:
-                x = numpy.random.random() * total_rate
-                edgefrom, edgeto = numpy.unravel_index(
-                    bisect.bisect(ps, x), rate_matrix.shape
-                )
-                if start[edgeto] == start[edgefrom]:
-                    continue
-                start[edgeto] = start[edgefrom]
-            except ValueError:
-                lang = numpy.random.randint(NLANG)
-                edgeto = numpy.random.randint(len(start))
-                if start[edgeto] == lang:
-                    continue
-                start[edgeto] = lang
-
-            yield time, edgeto, start[edgeto]
-            time += numpy.random.exponential(1 / total_rate)
-
-    for i in generate_history(start, 100, copy_rate_matrix):
-        image = numpy.vstack((image, start[None, :]))
-
-    plt.imshow(image.T, aspect="auto", interpolation="nearest")
-    plt.show()
+        history, loglikelihood = step_mcmc(model, history, loglikelihood)

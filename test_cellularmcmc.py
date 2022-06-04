@@ -1,7 +1,10 @@
+from collections import defaultdict
 import numpy
 import pytest
+from scipy import stats
+from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 
-from cellularmcmc import History
+from cellularmcmc import History, HistoryModel, step_mcmc
 
 
 @pytest.fixture(
@@ -48,25 +51,28 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
     change given an event.
 
     """
+    m = HistoryModel(ratematrix5, mu5, range(nlang5))
     for time, node, value in history5.all_changes():
         p_cond = numpy.zeros((len(history5.start()), nlang5))
         p_raw = numpy.zeros((len(history5.start()), nlang5))
         for potential_node in range(len(history5.start())):
             for alternative in range(nlang5):
-                p_raw[
-                    potential_node, alternative
-                ] = history5.calculate_event_likelihood(
-                    time, potential_node, alternative, ratematrix5, mu5, nlang5
+                p_raw[potential_node, alternative] = m.calculate_event_likelihood(
+                    history5,
+                    time,
+                    potential_node,
+                    alternative,
                 )
                 try:
-                    p_cond[
-                        potential_node, alternative
-                    ] = history5.calculate_change_likelihood(
-                        time, potential_node, alternative, ratematrix5, mu5, nlang5
+                    p_cond[potential_node, alternative] = m.calculate_change_likelihood(
+                        history5,
+                        time,
+                        potential_node,
+                        alternative,
                     )
                 except ValueError:
                     continue
-        q = 1 - history5.calculate_no_change_likelihood(time, ratematrix5, mu5, nlang5)
+        q = 1 - m.calculate_no_change_likelihood(history5, time)
         assert numpy.allclose(p_raw.sum(), 1)
         assert numpy.allclose(p_cond.sum(), 1)
         assert numpy.allclose(numpy.nan_to_num(p_raw / p_cond, q, q, q), q)
@@ -80,34 +86,26 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
 
     is constant for all changes (node, time).
     """
-    history = history5
-    copy_rate_matrix = ratematrix5
-    mutation_rate = mu5
-    nlang = nlang5
-
-    reference = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
-    changes = history.all_changes()
+    m = HistoryModel(ratematrix5, mu5, range(nlang5))
+    reference = m.loglikelihood(history5)
+    changes = history5.all_changes()
     for i, (time, node, value) in enumerate(changes):
-        alternatives = list(
-            history.alternatives_with_likelihood(
-                time, node, copy_rate_matrix, mutation_rate, nlang
-            )
-        )
+        alternatives = list(m.alternatives_with_likelihood(history5, time, node))
         # An alternative can be excluded because it is the previous or the next
         # state of the node; if the previous and next state are identical,
         # there is only one forbidden state.
-        assert nlang - 2 <= len(alternatives) <= nlang - 1
+        assert nlang5 - 2 <= len(alternatives) <= nlang5 - 1
         ps = []
         likelihoods = []
         for alternative, p in alternatives:
             try:
                 alternative_history = History(
-                    history.start(),
+                    history5.start(),
                     [
                         (time, node, value if j != i else alternative)
                         for j, (time, node, value) in enumerate(changes)
                     ],
-                    history.end,
+                    history5.end,
                 )
             except ValueError:
                 continue
@@ -115,13 +113,58 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
             if alternative == value:
                 p0 = p
 
-            likelihoods.append(
-                alternative_history.loglikelihood(
-                    copy_rate_matrix, mutation_rate, nlang
-                )
-            )
+            likelihoods.append(m.loglikelihood(alternative_history))
             ps.append(p)
         assert numpy.allclose(
             numpy.asarray(ps) / p0, numpy.exp(numpy.asarray(likelihoods) - reference)
         )
 
+
+class MCMCTest:
+    def __init__(self):
+        self.stats = defaultdict(list)
+        self.true = 16
+        self.mcmc = 8
+        self.mcmc_steps = 20
+        self.significance = 1e-3
+
+    def stats(self, history: History):
+        yield "n_changes", len(history.changes)
+
+    def compute_statistics(self, history):
+        yield "n_changes", len(history.all_changes())
+
+    def gather_statistics(self, ground_truth: bool, history: History):
+        for key, value in self.compute_statistics(history):
+            self.stats[ground_truth, key].append(value)
+
+    def test_statistics(self):
+        tests = {}
+        # C test for Poisson means
+        true_changes = self.stats[True, "n_changes"]
+        test_changes = self.stats[False, "n_changes"]
+        tests["n_changes are the same"] = (
+            poisson_2indep(
+                sum(true_changes), self.true, sum(test_changes), self.mcmc
+            ).pvalue
+            >= self.significance
+        )
+        return tests
+
+    def __call__(self, ratematrix5, mu5, nlang5):
+        m = HistoryModel(ratematrix5, mu5, range(nlang5))
+        for i in range(self.true):
+            self.gather_statistics(True, m.generate_history([0 for _ in range(5)], 10))
+        for i in range(self.mcmc):
+            h = m.generate_history([0 for _ in range(5)], 10)
+            lk = m.loglikelihood(h)
+            for i in range(self.mcmc_steps):
+                h, lk = step_mcmc(m, h, lk)
+            self.gather_statistics(False, h)
+
+        assert all(self.test_statistics().values())
+
+
+def test_mcmc(ratematrix5, mu5, nlang5):
+    test = MCMCTest()
+    test(ratematrix5, mu5, nlang5)
