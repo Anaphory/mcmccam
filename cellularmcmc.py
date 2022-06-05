@@ -207,7 +207,6 @@ class History(typing.Generic[L]):
             return None
         return self._states[time_slice + 1, node]
 
-
     def at(self, time: float, node: int) -> L:
         """Look up the value of a node at a particular time.
 
@@ -740,7 +739,9 @@ class HistoryModel:
         """
         alternative_history = deepcopy(history)
         time_slice = bisect.bisect_right(alternative_history._times[:, node], time) - 1
-        is_neighbor = (self.copy_rate_matrix[:, node] > 0) | (self.copy_rate_matrix[node, :] > 0)
+        is_neighbor = (self.copy_rate_matrix[:, node] > 0) | (
+            self.copy_rate_matrix[node, :] > 0
+        )
         neighbors = numpy.arange(len(is_neighbor))[is_neighbor]
         dependent_changes = list(history.related(time, node, neighbors))
         forbidden_values = set()
@@ -795,7 +796,10 @@ class HistoryModel:
                 # in terms of expon, something like this.
                 likelihood *= expon(
                     scale=1
-                    / (self.copy_rate_matrix[d_node, node] + self.copy_rate_matrix[node, d_node])
+                    / (
+                        self.copy_rate_matrix[d_node, node]
+                        + self.copy_rate_matrix[node, d_node]
+                    )
                 ).pdf(d_time - time)
                 likelihood *= self.calculate_change_likelihood(
                     alternative_history,
@@ -909,7 +913,8 @@ def gibbs_redraw_start(model, history, node=None):
     sump = 0.0
     probabilities = []
     values = []
-    for alternative, probability in model.alternatives_with_likelihood(history,
+    for alternative, probability in model.alternatives_with_likelihood(
+        history,
         0.0,
         node,
     ):
@@ -1178,11 +1183,9 @@ def add_change(model, history):
         changes,
         (pos, random_node, new_value),
     )
-    # FIXME: For the last change added, the subtraction of 1 instead of 2 needs
-    # to be reflected here.
-    return numpy.log(history.end * len(history.start()) * (model.nlang - 2)), History(
-        history.start(), changes, history.end
-    )
+    return numpy.log(
+        history.end * len(history.start()) * (model.nlang - skip)
+    ), History(history.start(), changes, history.end)
 
 
 def remove_change(model, history):
@@ -1219,7 +1222,9 @@ def remove_change(model, history):
             history._states[random_change, random_node],
         )
     )
-    return 0.0, History(history.start(), changes, history.end)
+    return -numpy.log(
+        history.end * len(history.start()) * (model.nlang - skip)
+    ), History(history.start(), changes, history.end)
 
 
 def add_or_remove_change(model, history):
