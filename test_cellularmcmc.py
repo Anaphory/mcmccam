@@ -5,6 +5,7 @@ from scipy import stats
 from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 
 from cellularmcmc import History, HistoryModel, step_mcmc
+from cellulartopology import make_block
 
 
 @pytest.fixture(
@@ -24,17 +25,31 @@ def history5(request):
     return History(*request.param)
 
 
-@pytest.fixture()
-def ratematrix5():
-    return numpy.ones((5, 5)) - numpy.diag(numpy.ones(5))
+@pytest.fixture(params=["line", "block", "star", "full"])
+def ratematrix5(history5, request):
+    n = len(history5.start())
+    if request.param == "star":
+        return numpy.vstack((
+            numpy.hstack(([0], numpy.ones(n-1))),
+            numpy.hstack((numpy.ones((n-1, 1)), numpy.zeros((n-1, n-1))))))
+    elif request.param == "block":
+        i = int(n**0.5)
+        j = n - i*i
+        return numpy.vstack((
+            numpy.hstack((make_block(i, i), numpy.ones((i*i, j)))),
+            numpy.ones((j, n))))
+    elif request.param == "line":
+        return numpy.diag(numpy.ones(n-1), 1) + numpy.diag(numpy.ones(n-1), -1)
+    else:
+        return numpy.ones((n, n)) - numpy.diag(numpy.ones(n))
 
 
-@pytest.fixture(params=[0.5])
+@pytest.fixture(params=[1.0, 0.5, 1e-16])
 def mu5(request):
     return request.param
 
 
-@pytest.fixture(params=[6, 3])
+@pytest.fixture(params=[3, 6, 200])
 def nlang5(request):
     return request.param
 
@@ -53,7 +68,7 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
     """
     m = HistoryModel(ratematrix5, mu5, range(nlang5))
     for time, node, value in history5.all_changes():
-        p_cond = numpy.zeros((len(history5.start()), nlang5))
+        logp_cond = numpy.full((len(history5.start()), nlang5), -numpy.inf)
         p_raw = numpy.zeros((len(history5.start()), nlang5))
         for potential_node in range(len(history5.start())):
             for alternative in range(nlang5):
@@ -64,7 +79,7 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
                     alternative,
                 )
                 try:
-                    p_cond[potential_node, alternative] = m.calculate_change_likelihood(
+                    logp_cond[potential_node, alternative] = m.calculate_change_loglikelihood(
                         history5,
                         time,
                         potential_node,
@@ -74,8 +89,8 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
                     continue
         q = 1 - m.calculate_no_change_likelihood(history5, time)
         assert numpy.allclose(p_raw.sum(), 1)
-        assert numpy.allclose(p_cond.sum(), 1)
-        assert numpy.allclose(numpy.nan_to_num(p_raw / p_cond, q, q, q), q)
+        assert numpy.allclose(numpy.exp(logp_cond).sum(), 1)
+        assert numpy.allclose(numpy.nan_to_num(p_raw / numpy.exp(logp_cond), q, q, q), q)
 
 
 def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
@@ -123,10 +138,10 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
 class MCMCTest:
     def __init__(self):
         self.stats = defaultdict(list)
-        self.true = 16
-        self.mcmc = 8
-        self.mcmc_steps = 20
-        self.significance = 1e-3
+        self.true = 32
+        self.mcmc = 64
+        self.mcmc_steps = 200
+        self.significance = 1e-4
 
     def stats(self, history: History):
         yield "n_changes", len(history.changes)

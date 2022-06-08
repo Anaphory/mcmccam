@@ -412,6 +412,117 @@ class HistoryModel:
             total_odds += p
         return p_of_choosing_this_node * odds_state / total_odds
 
+    def calculate_event_loglikelihood(
+        self,
+        history: History[L],
+        time: float,
+        node: int,
+        new_state: L,
+    ):
+        """Calculate the loglikelihood of an event at some point in the history.
+
+        This only calculates the likelihood that at a specific time point, a
+        particular node takes the given new value based on earlier events. It
+        does not compute the marginal likelihood of that change based on later
+        changes. The likelihood is not conditioned on the event being
+        observable as an actual change in the system state.
+
+        See also
+        ========
+
+        History.calculate_event_likelihood:
+            The same likelihood calculation, without the log.
+        History.calculate_change_likelihood:
+            The same likelihood calculation, conditioned on the fact than an
+            event is an actual change.
+
+        Examples
+        ========
+
+        1: Copying, without mutation
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        Imagine three equally connected nodes
+        >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+
+        that start in three different states
+        >>> start = ["A", "B", "C"]
+
+        out of a total of 5 different states
+        >>> nlang = 5
+
+        and no history of change yet.
+
+        Assume no mutations, and also assume that no changes have happened yet.
+
+        >>> h = History(start, [], end=1.0)
+        >>> m = HistoryModel(matrix, 0.0, range(nlang))
+
+        If the first change is at time 0.2, it will have equal probability of
+        changing node 0 to B (copied from node 1) or C (copied from node 2);
+        changing node 1 to A or C, or changing node 2 to A or B – so each has
+        probability 1/6.
+
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "B"))
+        0.16666666666666669
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 1, "A"))
+        0.16666666666666669
+
+        No other change has positive probability.
+        >>> for i in "A", "D", "E":
+        ...   print(m.calculate_event_loglikelihood(h, 0.2, 0, "D"))
+        -inf
+        -inf
+        -inf
+
+        2: Copying or mutation
+        ~~~~~~~~~~~~~~~~~~~~~~
+
+        Assume the same example as above, but now assume that mutations happen
+        with half the rate of anything being copied.
+
+        >>> m.mutation_rate = 0.5
+
+        Then each of the three nodes still has the same probability of being
+        the target of a change (1/3), but each copying is twice as likely as a
+        random mutation, so if we focus on node 0 as the target of a change: In
+        2 out of 5 cases it copies a B from node 1, in 2/5 cases it copies a C
+        from node 2, and with probability 1/25 each, it takes a new value of A,
+        B, C, D, or E.
+
+        So the probability of a change to A, D, or E is 1/(25*3), whereas a
+        change to B or C happens in 2/(5*3) + 1/(25*3) of cases.
+
+        >>> m.languages = range(5)
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "B"))
+        0.14666666666666667
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "C"))
+        0.14666666666666667
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "A"))
+        0.013333333333333338
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "D"))
+        0.013333333333333338
+        >>> numpy.exp(m.calculate_event_loglikelihood(h, 0.2, 0, "E"))
+        0.013333333333333338
+
+        """
+        logtotal_rate = numpy.log(
+            self.copy_rate_matrix.sum() + self.mutation_rate * history._states.shape[1]
+        )
+        logp_of_choosing_this_node = (
+            numpy.log(self.copy_rate_matrix.sum(0)[node] + self.mutation_rate)
+            - logtotal_rate
+        )
+        logodds_state = numpy.log(self.mutation_rate) - numpy.log(self.nlang)
+        log_total_odds = numpy.log(self.mutation_rate)
+        for edgefrom, p in enumerate(self.copy_rate_matrix[:, node]):
+            logp = numpy.log(p)
+            neighbor_state = history.before(time, edgefrom)
+            if neighbor_state == new_state:
+                logodds_state = numpy.logaddexp(logodds_state, logp)
+            log_total_odds = numpy.logaddexp(log_total_odds, logp)
+        return logp_of_choosing_this_node + logodds_state - log_total_odds
+
     def calculate_no_change_likelihood(
         self,
         history: History[L],
@@ -490,6 +601,93 @@ class HistoryModel:
                 state_before,
             )
         return p
+
+    def calculate_no_change_loglikelihood(
+        self,
+        history: History[L],
+        time: float,
+    ):
+        """Calculate the probability for non-change event.
+
+        This calculates the likelihood that an event, given to happen at a
+        specific time point, is unobservabve because it does not change the
+        state of the system. It does not compute the marginal likelihood of
+        that change based on later changes.
+
+
+        Example
+        =======
+
+        Imagine three equally connected nodes
+        >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+
+        that start in a mixed state
+        >>> start = ["A", "A", "B"]
+
+        out of a total of 5 different states
+        >>> nlang = 5
+
+        and no history of change yet.
+        Mutations happen with half the rate of
+        anything being copied.
+
+        >>> h = History(start, [])
+        >>> mu = 0.5
+        >>> m = HistoryModel(matrix, mu, range(nlang))
+
+        Then out of the 3*2.5 rate-weighted events, the ones that do not change
+        the system are
+
+         - Node 0 copies state A from node 1 (at rate 1),
+         - Node 0 mutates to state A randomly (p=1/5 at rate 0.5)
+        together at likelihood
+        >>> m.calculate_event_likelihood(h, 0.2, 0, "A")
+        0.14666666666666667
+
+         - Node 1 copies state A from node 0 (at rate 1),
+         - Node 1 mutates to state A randomly (p=1/5 at rate 0.5)
+        together at likelihood
+        >>> m.calculate_event_likelihood(h, 0.2, 1, "A")
+        0.14666666666666667
+
+        - Node 2 mutates to state B randomly (p=1/5 at rate 0.5)
+        >>> m.calculate_event_likelihood(h, 0.2, 2, "B")
+        0.013333333333333332
+
+        Together, this is a likelihood of
+        >>> numpy.exp(m.calculate_no_change_loglikelihood(h, 0.2))
+        0.3066666666666667
+
+        For two connected nodes with identical values, the only way of change
+        is a mutation. If there are only two values, each mutation is
+        observable with probability 1/2. If mutation happens at the same rate
+        as copying, the probability of an actual change is 1/4.
+
+        >>> l = HistoryModel(
+        ...   numpy.array([[0,1],[1,0]]), 1, ["A", "B"]
+        ...   ).calculate_no_change_loglikelihood(
+        ...     History(["A", "A"], []), 0.5)
+        >>> numpy.allclose(l, numpy.log(0.75))
+        True
+
+        """
+        for node in range(history._states.shape[1]):
+            state_before = history.before(time, node)
+            try:
+                logp = numpy.logaddexp(
+                    logp,
+                    self.calculate_event_loglikelihood(
+                        history,
+                        time,
+                        node,
+                        state_before,
+                    ),
+                )
+            except UnboundLocalError:
+                logp = self.calculate_event_loglikelihood(
+                    history, time, node, state_before
+                )
+        return logp
 
     def calculate_change_likelihood(
         self,
@@ -580,6 +778,101 @@ class HistoryModel:
             1 - self.calculate_no_change_likelihood(history, time)
         )
 
+    def calculate_change_loglikelihood(
+        self,
+        history: History[L],
+        time: float,
+        node: int,
+        new_state: L,
+    ):
+        """Calculate the likelihood of a change at some point in the history.
+
+        This only calculates the likelihood that at a specific time point, a
+        particular node takes the given new value based on earlier events. It
+        does not compute the marginal likelihood of that change based on later
+        changes. The likelihood is conditioned on the event being observable as
+        an actual change in the system state.
+
+        Raises
+        ======
+        ValueError("Event is no change")
+            if the ‘new’ node value is the same as the node value before the change.
+
+        See also
+        ========
+
+        History.calculate_event_likelihood:
+            The same likelihood calculation, not conditioned on the fact than an
+            event is an actual change.
+        History.calculate_no_change_likelihood:
+            The likelihood of a no-change event, used for conditioning.
+
+        Examples
+        ========
+
+        Imagine three equally connected nodes
+        >>> matrix = numpy.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+
+        that start in two different states
+        >>> start = ["A", "A", "B"]
+
+        out of a total of 5 different states
+        >>> nlang = 5
+
+        and no history of change yet.
+        >>> h = History(start, [])
+
+        Mutations happen with half the rate of anything being copied.
+
+        >>> mu = 0.5
+        >>> m = HistoryModel(matrix, mu, range(nlang))
+
+        Then a first event (let us assume at time 0.2) that sets the new value
+        of node 0 to A is no change.
+
+        >>> m.calculate_change_loglikelihood(h, 0.2, 0, "A")
+        Traceback (most recent call last):
+          ...
+        ValueError: Event is no change
+
+        The only copy events that are observable are those where node 2 copies
+        node 0 or node 1 (total rate 2) or vice versa (also total rate 2); in
+        addition, 4 out of 5 mutation events for each node are observable, each
+        with equal probability (rate 0.1 each). So node 2 gaining state A has a
+        probability of (2+0.1)/(2+2+3*0.4) = 21/52
+        >>> numpy.allclose(
+        ...   m.calculate_change_loglikelihood(h, 0.2, 2, "A") + numpy.log(52),
+        ...   numpy.log(21))
+        True
+        >>> numpy.allclose(
+        ...   m.calculate_change_loglikelihood(h, 0.2, 2, "C") + numpy.log(52),
+        ...   0)
+        True
+
+        All the valid likelihoods obviously add up to 1.
+        >>> p = 0
+        >>> for node in 0,1,2:
+        ...   for state in "A", "B", "C", "D", "E":
+        ...     try:
+        ...       p += m.calculate_change_likelihood(h, 0.2, node, state)
+        ...     except ValueError:
+        ...       print(node, state)
+        ...
+        0 A
+        1 A
+        2 B
+        >>> p
+        1.0
+
+        """
+        if history.before(time, node) == new_state:
+            raise ValueError("Event is no change")
+        return self.calculate_event_loglikelihood(
+            history, time, node, new_state
+        ) - numpy.log1p(
+            -numpy.exp(self.calculate_no_change_loglikelihood(history, time))
+        )
+
     def loglikelihood(
         self,
         history,
@@ -645,7 +938,9 @@ class HistoryModel:
            >>> m.calculate_change_likelihood(h, 0.5, 0, "B")
            0.5
 
-        >>> numpy.exp(m.loglikelihood(h, end=0.5)) == numpy.exp(-0.5) * 0.5
+        >>> numpy.allclose(
+        ...   m.loglikelihood(h, end=0.5),
+        ...   numpy.log( numpy.exp(-0.5) * 0.5 ))
         True
 
          - The probability that the second change happen at t=1.0. Now there
@@ -705,14 +1000,13 @@ class HistoryModel:
             if time > start:
                 logp += expon(scale=1 / rate_of_observable_change).logpdf(
                     time - prev_time
-                ) + numpy.log(
-                    self.calculate_change_likelihood(
+                )
+                logp += self.calculate_change_loglikelihood(
                         history,
                         time,
                         node,
                         value,
                     )
-                )
                 prev_time = time
 
             # Contribution from change
@@ -724,7 +1018,7 @@ class HistoryModel:
             ).sum() + mutation_change_rate
         return logp + expon(scale=1 / rate_of_observable_change).logsf(end - prev_time)
 
-    def alternatives_with_likelihood(
+    def alternatives_with_loglikelihood(
         self,
         history: History[L],
         time: float,
@@ -807,9 +1101,9 @@ class HistoryModel:
                     d_node,
                     d_value,
                 )
-            yield value, numpy.exp(loglikelihood)
+            yield value, loglikelihood
         for value in trivial_values:
-            yield value, numpy.exp(loglikelihood)
+            yield value, loglikelihood
 
     def generate_history(
         self,
@@ -824,7 +1118,7 @@ class HistoryModel:
         >>> m = HistoryModel(matrix, mu, range(nlang))
         >>> start = ["A", "A", "B"]
         >>> h = m.generate_history(start, 100.)
-        >>> m.loglikelihood(h) > -508 or m.loglikelihood(h)
+        >>> m.loglikelihood(h) > -512 or m.loglikelihood(h)
         True
 
         """
@@ -870,21 +1164,21 @@ def gibbs_redraw_change(model, history, change=None):
         except ValueError:
             return -numpy.inf, None
     time, node, value = changes[change]
-    sump = 0.0
+    sump = -numpy.inf
     probabilities = []
     values = []
-    for alternative, probability in model.alternatives_with_likelihood(
+    for alternative, probability in model.alternatives_with_loglikelihood(
         history,
         time,
         node,
     ):
-        sump += probability
+        sump = numpy.logaddexp(sump, probability)
         probabilities.append(sump)
         values.append(alternative)
-    if sump == 0:
+    if sump == -numpy.inf:
         new_value = values[numpy.random.randint(len(values))]
     else:
-        new_value = values[bisect.bisect(probabilities, numpy.random.random() * sump)]
+        new_value = values[bisect.bisect(numpy.exp(probabilities), numpy.random.random() * sump)]
     if new_value == value:
         return numpy.inf, history
     else:
@@ -1207,12 +1501,18 @@ def remove_change(model, history):
             # There must be a change back to the starting value after this
             # change, and that one would be safe to remove, so this loop can
             # stochastically run very long, but there are bound to be options
-            # that terminate it.
+            # that terminate it. (There is probably a better implementation.)
             random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
             random_change = numpy.random.randint(1, n_changes[random_node] + 1)
     except IndexError:
         # The change is just before the end of the history, so it is safe for remove.
         pass
+
+    after = history.after(history._times[random_change, random_node], random_node)
+    if after is None:
+        skip = 1
+    else:
+        skip = 2
 
     changes = history.all_changes()
     changes.remove(
