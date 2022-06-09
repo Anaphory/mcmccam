@@ -1,11 +1,10 @@
 import bisect
-from dataclasses import dataclass
 import itertools
 import typing
 from copy import deepcopy
+from dataclasses import dataclass
 
 import numpy
-from matplotlib import pyplot as plt
 from scipy.stats import expon
 
 L = typing.TypeVar("L", bound=typing.Hashable)
@@ -886,11 +885,7 @@ class HistoryModel:
         if history.before(time, node) == new_state:
             raise ValueError("Event is no change")
         loglk = self.calculate_event_loglikelihood(history, time, node, new_state)
-        if numpy.isnan(loglk):
-            breakpoint()
         logpchange = self.calculate_any_change_loglikelihood(history, time)
-        if numpy.isnan(logpchange):
-            breakpoint()
         return loglk - logpchange
 
     def loglikelihood(
@@ -1180,7 +1175,7 @@ def gibbs_redraw_change(model, history, change=None):
     changes = history.all_changes()
     if change is None:
         try:
-            change = numpy.random.randint(len(changes))
+            time, node, value = changes[numpy.random.randint(len(changes))]
         except ValueError:
             return -numpy.inf, None
     else:
@@ -1393,7 +1388,8 @@ def split_change(model, history):
 
             alternative_history = History(history.start(), changes, history.end)
             _, alternative_history = gibbs_redraw_change(
-                alternative_history, change=(move_existing_change_to, random_node, value_of_second_change)
+                alternative_history,
+                change=(move_existing_change_to, random_node, value_of_second_change),
             )
             return 0.0, alternative_history
 
@@ -1572,6 +1568,7 @@ if __name__ == "__main__":
     nlang = 200
     history = History(end, [(50, 10, 2)], end=end_time)
     mutation_rate = 1e-4
-    loglikelihood = history.loglikelihood(copy_rate_matrix, mutation_rate, nlang)
+    model = HistoryModel(copy_rate_matrix, mutation_rate, nlang)
+    loglikelihood = model.loglikelihood(history)
     while True:
         history, loglikelihood = step_mcmc(model, history, loglikelihood)
