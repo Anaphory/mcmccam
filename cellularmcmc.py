@@ -602,7 +602,7 @@ class HistoryModel:
             )
         return p
 
-    def calculate_no_change_loglikelihood(
+    def calculate_any_change_loglikelihood(
         self,
         history: History[L],
         time: float,
@@ -641,12 +641,14 @@ class HistoryModel:
          - Node 0 copies state A from node 1 (at rate 1),
          - Node 0 mutates to state A randomly (p=1/5 at rate 0.5)
         together at likelihood
-        >>> m.calculate_event_likelihood(h, 0.2, 0, "A")
-        0.14666666666666667
+        >>> numpy.allclose(
+        ...   m.calculate_event_likelihood(h, 0.2, 0, "A"),
+        ...   (1 + 0.5/5) / (3*2.5))
+        True
 
          - Node 1 copies state A from node 0 (at rate 1),
          - Node 1 mutates to state A randomly (p=1/5 at rate 0.5)
-        together at likelihood
+        together at that same likelihood
         >>> m.calculate_event_likelihood(h, 0.2, 1, "A")
         0.14666666666666667
 
@@ -655,8 +657,8 @@ class HistoryModel:
         0.013333333333333332
 
         Together, this is a likelihood of
-        >>> numpy.exp(m.calculate_no_change_loglikelihood(h, 0.2))
-        0.3066666666666667
+        >>> 1-numpy.exp(m.calculate_any_change_loglikelihood(h, 0.2))
+        0.30666666666666653
 
         For two connected nodes with identical values, the only way of change
         is a mutation. If there are only two values, each mutation is
@@ -665,28 +667,44 @@ class HistoryModel:
 
         >>> l = HistoryModel(
         ...   numpy.array([[0,1],[1,0]]), 1, ["A", "B"]
-        ...   ).calculate_no_change_loglikelihood(
+        ...   ).calculate_any_change_loglikelihood(
         ...     History(["A", "A"], []), 0.5)
-        >>> numpy.allclose(l, numpy.log(0.75))
+        >>> numpy.allclose(numpy.exp(l), 1/4)
         True
 
         """
-        for node in range(history._states.shape[1]):
+        logp = -numpy.inf
+        input_rates = self.copy_rate_matrix.sum()
+        n_nodes = len(history.start())
+        for node in range(n_nodes):
             state_before = history.before(time, node)
-            try:
+            inputs = numpy.arange(n_nodes)[self.copy_rate_matrix[:, node] > 0]
+            copy_values = {history.before(time, i) for i in inputs} - {state_before}
+            for v in copy_values:
                 logp = numpy.logaddexp(
                     logp,
                     self.calculate_event_loglikelihood(
                         history,
                         time,
                         node,
-                        state_before,
+                        v,
                     ),
                 )
-            except UnboundLocalError:
-                logp = self.calculate_event_loglikelihood(
-                    history, time, node, state_before
-                )
+
+            # p(change from mutation)
+            # = p(this node mutates) * p(it mutates to something not covered yet)
+            # = rate(this node mutates) / rate(any event)
+            #   * #(potential v's \ v's already covered \ {previous v}) / #(potential v's)
+            logp = numpy.logaddexp(
+                logp,
+                numpy.log(self.mutation_rate)
+                - numpy.log(n_nodes * self.mutation_rate + input_rates)
+                + numpy.log(self.nlang - len(copy_values) - 1)
+                - numpy.log(self.nlang),
+            )
+
+        if logp > 0.0:
+            return 0.0
         return logp
 
     def calculate_change_likelihood(
@@ -867,11 +885,13 @@ class HistoryModel:
         """
         if history.before(time, node) == new_state:
             raise ValueError("Event is no change")
-        return self.calculate_event_loglikelihood(
-            history, time, node, new_state
-        ) - numpy.log1p(
-            -numpy.exp(self.calculate_no_change_loglikelihood(history, time))
-        )
+        loglk = self.calculate_event_loglikelihood(history, time, node, new_state)
+        if numpy.isnan(loglk):
+            breakpoint()
+        logpchange = self.calculate_any_change_loglikelihood(history, time)
+        if numpy.isnan(logpchange):
+            breakpoint()
+        return loglk - logpchange
 
     def loglikelihood(
         self,
@@ -1002,11 +1022,11 @@ class HistoryModel:
                     time - prev_time
                 )
                 logp += self.calculate_change_loglikelihood(
-                        history,
-                        time,
-                        node,
-                        value,
-                    )
+                    history,
+                    time,
+                    node,
+                    value,
+                )
                 prev_time = time
 
             # Contribution from change
@@ -1163,26 +1183,33 @@ def gibbs_redraw_change(model, history, change=None):
             change = numpy.random.randint(len(changes))
         except ValueError:
             return -numpy.inf, None
-    time, node, value = changes[change]
-    sump = -numpy.inf
-    probabilities = []
+    else:
+        time, node, value = change
+    logsump = -numpy.inf
+    logcumprob = []
+    logprob = []
     values = []
-    for alternative, probability in model.alternatives_with_loglikelihood(
+    logprob_old = -numpy.inf
+    for alternative, logprobability in model.alternatives_with_loglikelihood(
         history,
         time,
         node,
     ):
-        sump = numpy.logaddexp(sump, probability)
-        probabilities.append(sump)
+        logprob.append(logprobability)
+        logsump = numpy.logaddexp(logsump, logprobability)
+        logcumprob.append(logsump)
         values.append(alternative)
-    if sump == -numpy.inf:
-        new_value = values[numpy.random.randint(len(values))]
+        if value == alternative:
+            logprob_old = logprobability
+    if logsump == -numpy.inf:
+        index = numpy.random.randint(len(values))
     else:
-        new_value = values[bisect.bisect(numpy.exp(probabilities), numpy.random.random() * sump)]
+        index = bisect.bisect(numpy.exp(logcumprob), numpy.random.random() * logsump)
+    new_value = values[index]
     if new_value == value:
-        return numpy.inf, history
+        return 0, history
     else:
-        return numpy.inf, History(
+        return logprob[index] - logprob_old, History(
             history.start(),
             [
                 (t, n, v if j != change else new_value)
@@ -1204,30 +1231,7 @@ def gibbs_redraw_start(model, history, node=None):
     if node is None:
         node = numpy.random.randint(len(start))
     value = start[node]
-    sump = 0.0
-    probabilities = []
-    values = []
-    for alternative, probability in model.alternatives_with_likelihood(
-        history,
-        0.0,
-        node,
-    ):
-        sump += probability
-        probabilities.append(sump)
-        values.append(alternative)
-    if sump == 0:
-        new_value = values[numpy.random.randint(len(values))]
-    else:
-        new_value = values[bisect.bisect(probabilities, numpy.random.random() * sump)]
-    if new_value == value:
-        return numpy.inf, history
-    else:
-        start[node] = new_value
-        return numpy.inf, History(
-            start,
-            history.all_changes(),
-            history.end,
-        )
+    return gibbs_redraw_change(model, history, change=(0.0, node, value))
 
 
 def move_change(model, history):
@@ -1260,7 +1264,7 @@ def split_change(model, history):
     heap = n_fict_changes.cumsum()
     random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
     if n_fict_changes[random_node] <= 2:
-        print("Case: No change")
+        # print("Case: No change")
         lower = numpy.random.uniform(-expon().rvs(), 0)
         upper = numpy.random.uniform(history.end, history.end + expon().rvs())
         mid = numpy.random.uniform(lower, upper - history.end)
@@ -1274,7 +1278,7 @@ def split_change(model, history):
     else:
         random_change = numpy.random.randint(0, n_fict_changes[random_node] + 1)
         if random_change == 0:
-            print("Case: Change before the start of history")
+            # print("Case: Change before the start of history")
             # Potentially moving it into the history.
             lower = numpy.random.uniform(-expon().rvs(), 0)
             upper = history._times[random_change + 1, random_node]
@@ -1283,14 +1287,14 @@ def split_change(model, history):
             mid = numpy.random.uniform(lower, 0.0)
             value_of_second_change = history._states[0, random_node]
         elif random_change == n_fict_changes[random_node]:
-            print("Case: Change after the end of history")
+            # print("Case: Change after the end of history")
             # Potentially adding the new change before the end.
             lower = history._times[random_change - 1, random_node]
             upper = numpy.random.uniform(history.end, history.end + expon().rvs())
             mid = numpy.random.uniform(history.end, upper)
             value_of_second_change = history.at(history.end, random_node)
         else:
-            print("Case: DEFAULT – Change in history")
+            # print("Case: DEFAULT – Change in history")
             lower = history._times[random_change - 1, random_node]
             upper = history._times[random_change + 1, random_node]
             if upper > history.end:
@@ -1301,38 +1305,38 @@ def split_change(model, history):
     new_change_time = numpy.random.uniform(lower, mid)
     move_existing_change_to = numpy.random.uniform(mid, upper)
     if move_existing_change_to <= 0.0:
-        print("Sub 0")
+        # print("Sub 0")
         # The old change was before history, and the second of the new changes
         # is also before history. History doesn't change.
         return 0.0, history
     elif move_existing_change_to > history.end:
         if new_change_time > history.end:
-            print("Sub 1")
+            # print("Sub 1")
             # The new change is outside history, so the moved old change even
             # more so. History doesn't change.
             return 0.0, history
         if new_change_time <= 0.0:
-            print("Sub 2")
+            # print("Sub 2")
             # Both the change before and the change after are on different ends
             # of history, so change the value of the node – completely
             # throughout history – at random
             _, alternative_history = gibbs_redraw_start(history, node=random_node)
             return 0.0, alternative_history
         else:
-            print("Sub 3")
+            # print("Sub 3")
             # Add a new change at the end
             changes = history.all_changes()
             new_change_pos = bisect.bisect(changes, (new_change_time, random_node, -1))
             changes.insert(new_change_pos, (new_change_time, random_node, -1))
             alternative_history = History(history.start(), changes, history.end)
             _, alternative_history = gibbs_redraw_change(
-                alternative_history, change=new_change_pos
+                alternative_history, change=(new_change_time, random_node, -1)
             )
             return 0.0, alternative_history
     else:
         if mid <= 0.0:
             # The second change is inside history, but it wasn't before.
-            print("Sub 4a")
+            # print("Sub 4a")
             # Add the new change before the start, i.e. change the starting value and the position of the first change.
             alternative_history = deepcopy(history)
             new_value = numpy.random.randint(nlang - 1)
@@ -1359,7 +1363,7 @@ def split_change(model, history):
             alternative_history._times[1, random_node] = move_existing_change_to
             return 0.0, alternative_history
         elif new_change_time <= 0.0:
-            print("Sub 4")
+            # print("Sub 4")
             # Add the new change before the start, i.e. change the starting value and the position of the first change.
             alternative_history = deepcopy(history)
             new_value = numpy.random.randint(nlang - 1)
@@ -1370,7 +1374,7 @@ def split_change(model, history):
             alternative_history._times[1, random_node] = move_existing_change_to
             return 0.0, alternative_history
         else:
-            print("Sub 5")
+            # print("Sub 5")
             # The normal case: The new change and the moved change are both within the history.
             changes = [
                 (t, n, v)
@@ -1389,7 +1393,7 @@ def split_change(model, history):
 
             alternative_history = History(history.start(), changes, history.end)
             _, alternative_history = gibbs_redraw_change(
-                alternative_history, change=new_change_pos
+                alternative_history, change=(move_existing_change_to, random_node, value_of_second_change)
             )
             return 0.0, alternative_history
 
@@ -1546,16 +1550,16 @@ def step_mcmc(model, history, loglikelihood) -> tuple[History, float]:
     operator = select_operator()
     hastings_ratio, candidate_history = operator(model, deepcopy(history))
     if hastings_ratio == -numpy.inf:
-        print(operator.__name__, "rejected: Impossible")
+        # print(operator.__name__, "rejected: Impossible")
         return history, loglikelihood
     candidate_loglikelihood = model.loglikelihood(candidate_history)
     logp = candidate_loglikelihood + hastings_ratio - loglikelihood
     if (logp > 0) or (numpy.random.random() < numpy.exp(logp)):
-        print(operator.__name__, "accepted")
+        # print(operator.__name__, "accepted")
         history = candidate_history
-        print(history)
-    else:
-        print(operator.__name__, "rejected")
+        # print(history)
+    # else: print(operator.__name__, "rejected")
+
     return history, candidate_loglikelihood
 
 

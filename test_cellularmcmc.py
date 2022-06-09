@@ -7,6 +7,8 @@ from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 from cellularmcmc import History, HistoryModel, step_mcmc
 from cellulartopology import make_block
 
+from tqdm import tqdm
+
 
 @pytest.fixture(
     params=[
@@ -25,21 +27,32 @@ def history5(request):
     return History(*request.param)
 
 
-@pytest.fixture(params=["line", "block", "star", "full"])
+@pytest.fixture(params=["line", "block", "star", "shift", "full"])
 def ratematrix5(history5, request):
     n = len(history5.start())
     if request.param == "star":
-        return numpy.vstack((
-            numpy.hstack(([0], numpy.ones(n-1))),
-            numpy.hstack((numpy.ones((n-1, 1)), numpy.zeros((n-1, n-1))))))
+        return numpy.vstack(
+            (
+                numpy.hstack(([0], numpy.ones(n - 1))),
+                numpy.hstack((numpy.ones((n - 1, 1)), numpy.zeros((n - 1, n - 1)))),
+            )
+        )
     elif request.param == "block":
         i = int(n**0.5)
-        j = n - i*i
-        return numpy.vstack((
-            numpy.hstack((make_block(i, i), numpy.ones((i*i, j)))),
-            numpy.ones((j, n))))
+        j = n - i * i
+        return numpy.vstack(
+            (
+                numpy.hstack((make_block(i, i), numpy.ones((i * i, j)))),
+                numpy.ones((j, n)),
+            )
+        )
     elif request.param == "line":
-        return numpy.diag(numpy.ones(n-1), 1) + numpy.diag(numpy.ones(n-1), -1)
+        return numpy.diag(numpy.ones(n - 1), 1) + numpy.diag(numpy.ones(n - 1), -1)
+    elif request.param == "shift":
+        array = numpy.diag(numpy.ones(n - 1), 1)
+        array[-1, 0] = 1
+        assert (array.sum(1) == 1).all()
+        return array
     else:
         return numpy.ones((n, n)) - numpy.diag(numpy.ones(n))
 
@@ -52,6 +65,39 @@ def mu5(request):
 @pytest.fixture(params=[3, 6, 200])
 def nlang5(request):
     return request.param
+
+
+def test_REG1():
+    history = History([0, 0, 0, 0, 0], [(0.5, 0, 1)], 1.0)
+    model = HistoryModel(
+        copy_rate_matrix=numpy.array(
+            [
+                [0.0, 1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0],
+            ]
+        ),
+        mutation_rate=1e-16,
+        languages=range(0, 3),
+    )
+
+    assert numpy.allclose(
+        numpy.exp(model.calculate_event_loglikelihood(history, 0.4, 0, 0)), 1 / 8
+    )
+
+
+def test_p_any_change_leq_1(history5, ratematrix5, mu5, nlang5):
+    m = HistoryModel(ratematrix5, mu5, range(nlang5))
+    for time, node, value in history5.all_changes():
+        assert m.calculate_any_change_loglikelihood(history5, time) <= 0
+        assert m.calculate_no_change_likelihood(history5, time) <= 1
+        assert numpy.allclose(
+            numpy.exp(m.calculate_any_change_loglikelihood(history5, time))
+            + m.calculate_no_change_likelihood(history5, time),
+            1.0,
+        )
 
 
 def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
@@ -79,7 +125,9 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
                     alternative,
                 )
                 try:
-                    logp_cond[potential_node, alternative] = m.calculate_change_loglikelihood(
+                    logp_cond[
+                        potential_node, alternative
+                    ] = m.calculate_change_loglikelihood(
                         history5,
                         time,
                         potential_node,
@@ -90,7 +138,9 @@ def test_likelihoods_add_up(history5, ratematrix5, mu5, nlang5):
         q = 1 - m.calculate_no_change_likelihood(history5, time)
         assert numpy.allclose(p_raw.sum(), 1)
         assert numpy.allclose(numpy.exp(logp_cond).sum(), 1)
-        assert numpy.allclose(numpy.nan_to_num(p_raw / numpy.exp(logp_cond), q, q, q), q)
+        assert numpy.allclose(
+            numpy.nan_to_num(p_raw / numpy.exp(logp_cond), q, q, q), q
+        )
 
 
 def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
@@ -105,14 +155,14 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
     reference = m.loglikelihood(history5)
     changes = history5.all_changes()
     for i, (time, node, value) in enumerate(changes):
-        alternatives = list(m.alternatives_with_likelihood(history5, time, node))
+        alternatives = list(m.alternatives_with_loglikelihood(history5, time, node))
         # An alternative can be excluded because it is the previous or the next
         # state of the node; if the previous and next state are identical,
         # there is only one forbidden state.
         assert nlang5 - 2 <= len(alternatives) <= nlang5 - 1
-        ps = []
+        logps = []
         likelihoods = []
-        for alternative, p in alternatives:
+        for alternative, logp in alternatives:
             try:
                 alternative_history = History(
                     history5.start(),
@@ -126,12 +176,12 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
                 continue
 
             if alternative == value:
-                p0 = p
+                logp0 = logp
 
             likelihoods.append(m.loglikelihood(alternative_history))
-            ps.append(p)
+            logps.append(logp)
         assert numpy.allclose(
-            numpy.asarray(ps) / p0, numpy.exp(numpy.asarray(likelihoods) - reference)
+            numpy.asarray(logps) - logp0, numpy.asarray(likelihoods) - reference
         )
 
 
@@ -168,18 +218,22 @@ class MCMCTest:
 
     def __call__(self, ratematrix5, mu5, nlang5):
         m = HistoryModel(ratematrix5, mu5, range(nlang5))
+        t = tqdm(total=self.true + self.mcmc*self.mcmc_steps)
         for i in range(self.true):
             self.gather_statistics(True, m.generate_history([0 for _ in range(5)], 10))
+            t.update()
         for i in range(self.mcmc):
             h = m.generate_history([0 for _ in range(5)], 10)
             lk = m.loglikelihood(h)
             for i in range(self.mcmc_steps):
                 h, lk = step_mcmc(m, h, lk)
+                t.update()
             self.gather_statistics(False, h)
 
         assert all(self.test_statistics().values())
 
 
-def test_mcmc(ratematrix5, mu5, nlang5):
+def test_mcmc(ratematrix5, mu5, nlang5, capsys):
     test = MCMCTest()
-    test(ratematrix5, mu5, nlang5)
+    with capsys.disabled():
+        test(ratematrix5, mu5, nlang5)
