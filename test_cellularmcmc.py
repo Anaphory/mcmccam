@@ -1,3 +1,5 @@
+import json
+import tempfile
 from collections import defaultdict
 
 import numpy
@@ -188,7 +190,8 @@ def test_alternative_with_likelihood(history5, ratematrix5, mu5, nlang5):
 
 class MCMCTest:
     def __init__(self):
-        self.stats = defaultdict(list)
+        self.true_stats = defaultdict(list)
+        self.mcmc_stats = defaultdict(list)
         self.true = 32
         self.mcmc = 64
         self.mcmc_steps = 200
@@ -201,14 +204,17 @@ class MCMCTest:
 
     def gather_statistics(self, ground_truth: bool, history: History):
         for key, value in self.compute_statistics(history):
-            self.stats[ground_truth, key].append(value)
+            if ground_truth:
+                self.true_stats[ground_truth, key].append(value)
+            else:
+                self.mcmc_stats[ground_truth, key].append(value)
 
     def test_statistics(self):
         tests = {}
 
         # C test for Poisson means
-        true_changes = self.stats[True, "n_changes"]
-        test_changes = self.stats[False, "n_changes"]
+        true_changes = self.true_stats["n_changes"]
+        test_changes = self.mcmc_stats["n_changes"]
         tests["n_changes are the same"] = (
             poisson_2indep(
                 sum(true_changes), self.true, sum(test_changes), self.mcmc
@@ -217,11 +223,9 @@ class MCMCTest:
         )
 
         # Perform Kolmorogorov-Smirnov-tests for all those stats.
-        for (group, key), value in self.stats.items():
-            if not group:
-                continue
+        for key, value in self.true_stats.items():
             tests[f"Kolmogorov-Smirnov {key}"] = (
-                stats.kstest(self.stats[False, key], value).pvalue >= self.significance
+                stats.kstest(self.mcmc_stats[key], value).pvalue >= self.significance
             )
 
         return tests
@@ -240,7 +244,20 @@ class MCMCTest:
                 # t.update()
             self.gather_statistics(False, h)
 
-        assert all(self.test_statistics().values())
+        _, path = tempfile.mkstemp(".json", "report-")
+        with open(path, "w") as statsfile:
+            json.dump(
+                {
+                    key: {"True": value, "MCMC": self.mcmc_stats.get(key)}
+                    for key, value in self.true_stats.items()
+                },
+                statsfile,
+                indent=2,
+                sort_keys=True,
+            )
+        assert all(
+            self.test_statistics().values()
+        ), f"Some stats don't match between MCMC and direct generation. Check {path} for details."
 
 
 def test_mcmc(ratematrix5, mu5, nlang5, capsys):
