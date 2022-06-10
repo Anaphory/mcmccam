@@ -1,13 +1,14 @@
 from collections import defaultdict
+
 import numpy
 import pytest
 from scipy import stats
 from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 
-from cellularmcmc import History, HistoryModel, step_mcmc
+from cellularmcmc import History
+from cellularmcmc import HistoryModel
+from cellularmcmc import step_mcmc
 from cellulartopology import make_block
-
-from tqdm import tqdm
 
 
 @pytest.fixture(
@@ -193,11 +194,10 @@ class MCMCTest:
         self.mcmc_steps = 200
         self.significance = 1e-4
 
-    def stats(self, history: History):
-        yield "n_changes", len(history.changes)
-
     def compute_statistics(self, history):
         yield "n_changes", len(history.all_changes())
+        yield "time_until_first_change", history.all_changes()[0][0]
+        yield "n_changes_node0", len([1 for t, n, v in history.all_changes() if n == 0])
 
     def gather_statistics(self, ground_truth: bool, history: History):
         for key, value in self.compute_statistics(history):
@@ -205,6 +205,7 @@ class MCMCTest:
 
     def test_statistics(self):
         tests = {}
+
         # C test for Poisson means
         true_changes = self.stats[True, "n_changes"]
         test_changes = self.stats[False, "n_changes"]
@@ -214,20 +215,29 @@ class MCMCTest:
             ).pvalue
             >= self.significance
         )
+
+        # Perform Kolmorogorov-Smirnov-tests for all those stats.
+        for (group, key), value in self.stats.items():
+            if not group:
+                continue
+            tests[f"Kolmogorov-Smirnov {key}"] = (
+                stats.kstest(self.stats[False, key], value).pvalue >= self.significance
+            )
+
         return tests
 
     def __call__(self, ratematrix5, mu5, nlang5):
         m = HistoryModel(ratematrix5, mu5, range(nlang5))
-        t = tqdm(total=self.true + self.mcmc*self.mcmc_steps)
+        # t = tqdm(total=self.true + self.mcmc*self.mcmc_steps)
         for i in range(self.true):
             self.gather_statistics(True, m.generate_history([0 for _ in range(5)], 10))
-            t.update()
+            # t.update()
         for i in range(self.mcmc):
             h = m.generate_history([0 for _ in range(5)], 10)
             lk = m.loglikelihood(h)
             for i in range(self.mcmc_steps):
                 h, lk = step_mcmc(m, h, lk)
-                t.update()
+                # t.update()
             self.gather_statistics(False, h)
 
         assert all(self.test_statistics().values())
