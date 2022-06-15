@@ -4,13 +4,13 @@ from collections import defaultdict
 
 import numpy
 import pytest
-from cellulartopology import make_block
 from scipy import stats
 from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 
-from cellularmcmc import History
-from cellularmcmc import HistoryModel
-from cellularmcmc import step_mcmc
+from cellularmcmc.cellularmcmc import History
+from cellularmcmc.cellularmcmc import HistoryModel
+from cellularmcmc.cellularmcmc import step_mcmc
+from cellularmcmc.cellulartopology import make_block
 
 
 @pytest.fixture(
