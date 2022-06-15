@@ -4,13 +4,13 @@ from collections import defaultdict
 
 import numpy
 import pytest
+from cellulartopology import make_block
 from scipy import stats
 from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep
 
 from cellularmcmc import History
 from cellularmcmc import HistoryModel
 from cellularmcmc import step_mcmc
-from cellulartopology import make_block
 
 
 @pytest.fixture(
@@ -199,15 +199,18 @@ class MCMCTest:
 
     def compute_statistics(self, history):
         yield "n_changes", len(history.all_changes())
-        yield "time_until_first_change", history.all_changes()[0][0]
+        try:
+            yield "time_until_first_change", history.all_changes()[0][0]
+        except IndexError:
+            yield "time_until_first_change", numpy.inf
         yield "n_changes_node0", len([1 for t, n, v in history.all_changes() if n == 0])
 
     def gather_statistics(self, ground_truth: bool, history: History):
         for key, value in self.compute_statistics(history):
             if ground_truth:
-                self.true_stats[ground_truth, key].append(value)
+                self.true_stats[key].append(value)
             else:
-                self.mcmc_stats[ground_truth, key].append(value)
+                self.mcmc_stats[key].append(value)
 
     def test_statistics(self):
         tests = {}

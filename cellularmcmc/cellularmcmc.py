@@ -400,7 +400,7 @@ class HistoryModel:
             self.copy_rate_matrix.sum() + self.mutation_rate * history._states.shape[1]
         )
         p_of_choosing_this_node = (
-            self.copy_rate_matrix.sum(0)[node] + self.mutation_rate
+            self.copy_rate_matrix[:, node].sum() + self.mutation_rate
         ) / total_rate
         odds_state = self.mutation_rate / self.nlang
         total_odds = self.mutation_rate
@@ -509,7 +509,7 @@ class HistoryModel:
             self.copy_rate_matrix.sum() + self.mutation_rate * history._states.shape[1]
         )
         logp_of_choosing_this_node = (
-            numpy.log(self.copy_rate_matrix.sum(0)[node] + self.mutation_rate)
+            numpy.log(self.copy_rate_matrix[:, node].sum() + self.mutation_rate)
             - logtotal_rate
         )
         logodds_state = numpy.log(self.mutation_rate) - numpy.log(self.nlang)

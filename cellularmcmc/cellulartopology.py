@@ -1,6 +1,7 @@
-import numpy
-import typing
 import itertools
+import typing
+
+import numpy
 
 
 class Neighborhood:
