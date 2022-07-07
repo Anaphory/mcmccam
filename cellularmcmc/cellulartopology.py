@@ -60,7 +60,7 @@ class VonNeumann(Neighborhood):
         """
         multiindex = numpy.asarray(multiindex)
         for dx in itertools.product([-1, 0, 1], repeat=len(multiindex)):
-            if dx.any():
+            if any(dx):
                 yield tuple(multiindex + dx)
 
 
@@ -93,7 +93,8 @@ class PseudoHex(Neighborhood):
 
         TypeError when multiindex has not exactly 2 entries.
 
-        The internals may be a bit confusing, but you can see that neighbors-of-neighbors are exactly 1+6+12:
+        The internals may be a bit confusing, but you can see that
+        neighbors-of-neighbors are exactly 1+6+12:
 
              2 2 2
             2 1 1 2
@@ -105,7 +106,6 @@ class PseudoHex(Neighborhood):
         19
         >>> len({c2 for c1 in PseudoHex.neighbors((0, 1)) for c2 in PseudoHex.neighbors((c1))})
         19
-
 
         """
         x, y = multiindex
