@@ -1,3 +1,4 @@
+"""Methods for MCMC on a CTMC copy graph."""
 import bisect
 import itertools
 import typing
@@ -10,7 +11,18 @@ from scipy.stats import expon
 L = typing.TypeVar("L", bound=typing.Hashable)
 
 
+exponential_distribution = expon()
+
+
 class History(typing.Generic[L]):
+    """The history of a CTMC copy graph.
+
+    A history represents a starting state at time t=0.0, and a set of
+    changes (t, n, v), where at time t the node at index n takes the new
+    value v.
+
+    """
+
     end: float
 
     def __init__(
@@ -1013,9 +1025,9 @@ class HistoryModel:
                 break
             # Contribution from waiting time
             if time > start:
-                logp += expon(scale=1 / rate_of_observable_change).logpdf(
-                    time - prev_time
-                )
+                logp += exponential_distribution.logpdf(
+                    (time - prev_time) * rate_of_observable_change
+                ) + numpy.log(rate_of_observable_change)
                 logp += self.calculate_change_loglikelihood(
                     history,
                     time,
@@ -1031,7 +1043,9 @@ class HistoryModel:
             rate_of_observable_change = (
                 self.copy_rate_matrix * observable_transition
             ).sum() + mutation_change_rate
-        return logp + expon(scale=1 / rate_of_observable_change).logsf(end - prev_time)
+        return logp + exponential_distribution.logsf(
+            (end - prev_time) * rate_of_observable_change
+        )
 
     def alternatives_with_loglikelihood(
         self,
@@ -1103,13 +1117,18 @@ class HistoryModel:
 
                 # But I don't know whether that change has a simple expression
                 # in terms of expon, something like this.
-                likelihood *= expon(
-                    scale=1
-                    / (
-                        self.copy_rate_matrix[d_node, node]
-                        + self.copy_rate_matrix[node, d_node]
+                likelihood *= exponential_distribution.pdf(
+                    (d_time - time)
+                    * (
+                        (
+                            self.copy_rate_matrix[d_node, node]
+                            + self.copy_rate_matrix[node, d_node]
+                        )
                     )
-                ).pdf(d_time - time)
+                ) * (
+                    self.copy_rate_matrix[d_node, node]
+                    + self.copy_rate_matrix[node, d_node]
+                )
                 likelihood *= self.calculate_change_likelihood(
                     alternative_history,
                     d_time,
@@ -1143,7 +1162,7 @@ class HistoryModel:
             time = 0
             ps = numpy.cumsum(self.copy_rate_matrix.flat)
             total_rate = ps[-1] + self.mutation_rate * len(state)
-            time += expon(scale=1 / total_rate).rvs()
+            time += exponential_distribution.rvs() * (1 / total_rate)
             while time < end:
                 x = numpy.random.random() * total_rate
                 if x > ps[-1]:
@@ -1159,7 +1178,7 @@ class HistoryModel:
                     if state[edgeto] != state[edgefrom]:
                         state[edgeto] = state[edgefrom]
                         yield (time, edgeto, state[edgeto])
-                time += numpy.random.exponential(1 / total_rate)
+                time += exponential_distribution.rvs() * (1 / total_rate)
 
         return History(start, changes(), end)
 
@@ -1250,211 +1269,8 @@ def move_change(model, history):
     return 0.0, alternative_history
 
 
-# GOALS:
-# A pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
-def split_change(model, history):
-    # Pick a random change, including for each node the one before the start
-    # and the one after the end of history
-    n_fict_changes = (history._times <= history.end).sum(0) + 1
-    heap = n_fict_changes.cumsum()
-    random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
-    if n_fict_changes[random_node] <= 2:
-        # print("Case: No change")
-        lower = numpy.random.uniform(-expon().rvs(), 0)
-        upper = numpy.random.uniform(history.end, history.end + expon().rvs())
-        mid = numpy.random.uniform(lower, upper - history.end)
-        if mid > 0:
-            mid += history.end
-            value_of_second_change = numpy.random.randint(nlang - 1)
-            if value_of_second_change == history._states[0, random_node]:
-                value_of_second_change = nlang - 1
-        else:
-            value_of_second_change = history._states[0, random_node]
-    else:
-        random_change = numpy.random.randint(0, n_fict_changes[random_node] + 1)
-        if random_change == 0:
-            # print("Case: Change before the start of history")
-            # Potentially moving it into the history.
-            lower = numpy.random.uniform(-expon().rvs(), 0)
-            upper = history._times[random_change + 1, random_node]
-            if upper > history.end:
-                upper = numpy.random.uniform(history.end, history.end + expon().rvs())
-            mid = numpy.random.uniform(lower, 0.0)
-            value_of_second_change = history._states[0, random_node]
-        elif random_change == n_fict_changes[random_node]:
-            # print("Case: Change after the end of history")
-            # Potentially adding the new change before the end.
-            lower = history._times[random_change - 1, random_node]
-            upper = numpy.random.uniform(history.end, history.end + expon().rvs())
-            mid = numpy.random.uniform(history.end, upper)
-            value_of_second_change = history.at(history.end, random_node)
-        else:
-            # print("Case: DEFAULT – Change in history")
-            lower = history._times[random_change - 1, random_node]
-            upper = history._times[random_change + 1, random_node]
-            if upper > history.end:
-                upper = numpy.random.uniform(history.end, history.end + expon().rvs())
-            mid = history._times[random_change, random_node]
-            value_of_second_change = history._states[random_change, random_node]
-
-    new_change_time = numpy.random.uniform(lower, mid)
-    move_existing_change_to = numpy.random.uniform(mid, upper)
-    if move_existing_change_to <= 0.0:
-        # print("Sub 0")
-        # The old change was before history, and the second of the new changes
-        # is also before history. History doesn't change.
-        return 0.0, history
-    elif move_existing_change_to > history.end:
-        if new_change_time > history.end:
-            # print("Sub 1")
-            # The new change is outside history, so the moved old change even
-            # more so. History doesn't change.
-            return 0.0, history
-        if new_change_time <= 0.0:
-            # print("Sub 2")
-            # Both the change before and the change after are on different ends
-            # of history, so change the value of the node – completely
-            # throughout history – at random
-            hastings, alternative_history = gibbs_redraw_start(
-                history, node=random_node
-            )
-            return hastings, alternative_history
-        else:
-            # print("Sub 3")
-            # Add a new change at the end
-            changes = history.all_changes()
-            new_change_pos = bisect.bisect(changes, (new_change_time, random_node, -1))
-            changes.insert(new_change_pos, (new_change_time, random_node, -1))
-            alternative_history = History(history.start(), changes, history.end)
-            hastings, alternative_history = gibbs_redraw_change(
-                alternative_history, change=(new_change_time, random_node, -1)
-            )
-            return hastings, alternative_history
-    else:
-        if mid <= 0.0:
-            # The second change is inside history, but it wasn't before.
-            # print("Sub 4a")
-            # Add the new change before the start, i.e. change the starting value and the position of the first change.
-            alternative_history = deepcopy(history)
-            new_value = numpy.random.randint(nlang - 1)
-            if new_value == value_of_second_change:
-                new_value = nlang - 1
-            if alternative_history._states[-1, random_node] != numpy.inf:
-                # This node is one of those with the longest history.
-                # To add another change for it, we need to first expand the history array.
-                alternative_history._times = numpy.vstack(
-                    (
-                        alternative_history._times,
-                        numpy.full_like(alternative_history._times[0], numpy.inf),
-                    )
-                )
-                alternative_history._states = numpy.vstack(
-                    (
-                        alternative_history._states,
-                        numpy.zeros_like(alternative_history._states[0]),
-                    )
-                )
-                alternative_history._states[1, random_node] = new_value
-            alternative_history._states[0, random_node] = new_value
-            alternative_history._states[1, random_node] = value_of_second_change
-            alternative_history._times[1, random_node] = move_existing_change_to
-            return 0.0, alternative_history
-        elif new_change_time <= 0.0:
-            # print("Sub 4")
-            # Add the new change before the start, i.e. change the starting value and the position of the first change.
-            alternative_history = deepcopy(history)
-            new_value = numpy.random.randint(nlang - 1)
-            if new_value == value_of_second_change:
-                new_value = nlang - 1
-            alternative_history._states[0, random_node] = new_value
-            alternative_history._states[1, random_node] = value_of_second_change
-            alternative_history._times[1, random_node] = move_existing_change_to
-            return 0.0, alternative_history
-        else:
-            # print("Sub 5")
-            # The normal case: The new change and the moved change are both within the history.
-            changes = [
-                (t, n, v)
-                for t, n, v in history.all_changes()
-                if t != mid or n != random_node or v != value_of_second_change
-            ]
-            new_change_pos = bisect.bisect(changes, (new_change_time, random_node, 0))
-            changes.insert(new_change_pos, (new_change_time, random_node, -1))
-            moved_change_pos = bisect.bisect(
-                changes, (move_existing_change_to, random_node, value_of_second_change)
-            )
-            changes.insert(
-                moved_change_pos,
-                (move_existing_change_to, random_node, value_of_second_change),
-            )
-
-            alternative_history = History(history.start(), changes, history.end)
-            hastings, alternative_history = gibbs_redraw_change(
-                alternative_history,
-                change=(move_existing_change_to, random_node, value_of_second_change),
-            )
-            return hastings, alternative_history
-
-
-def merge_changes(model, history):
-    # Pick a pair of subsequent random changes (which can lie outside the history)
-    n_fict_changes = (history._times <= history.end).sum(0)
-    heap = n_fict_changes.cumsum()
-    random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
-    random_change = numpy.random.randint(n_fict_changes[random_node])
-    if 0 == n_fict_changes[random_node] - 1:
-        # There is no actual change on this segment.
-        ...
-    elif random_change == 0:
-        # Merge the first change with the change before the start. This can
-        # either remove the first change, or it can change the start value and
-        # move the first change.
-        before_start = -expon().rvs()
-        mid = (before_start + history._times[random_change + 1, random_node]) / 2.0
-        if mid < 0.0:
-            # Merged to before beginning: Remove change and set its value as the starting value
-            history = deepcopy(history)
-            history._states[0:-1, random_node] = history._states[1:, random_node]
-            history._times[1:-1, random_node] = history._states[2:, random_node]
-            history._times[0, random_node] = 0
-            history._times[-1, random_node] = numpy.inf
-            return 0.0, history
-        else:
-            history._times[1, random_node]
-            ...
-    elif random_change == n_fict_changes[random_node] - 1:
-        # Merge the last change with the change after the end of history. This
-        # can either remove the last change (if it is merged to after the end
-        # of history), or it can change the value and move that last change.
-        after_end = history.end + expon().rvs()
-        mid = (history._times[random_change, random_node] + after_end) / 2.0
-        if end > history.end:
-            ...
-        else:
-            ...
-    else:
-        # Both changes lie inside history. Check that they are different,
-        # otherwise the merge will not be a change (so the un-merge can not be
-        # generated by split_change, and accepting this move would violate the
-        # reversible jump assumption.)
-        history = deepcopy(history)
-        value_before = history._states[random_change - 1, random_node]
-        value_after = history._states[random_change + 1, random_node]
-        if value_before == value_after:
-            return -numpy.inf, history
-        mid = (
-            history._times[random_change, random_node]
-            + history._times[random_change + 1, random_node]
-        ) / 2.0
-        history._states[random_change:-1, random_node] = history._states[
-            random_change + 1 :, random_node
-        ]
-        history._times[random_change + 1 : -1, random_node] = history._states[
-            random_change + 2 : -1, random_node
-        ]
-        history._times[random_change, random_node] = mid
-        history._times[-1, random_node] = numpy.inf
-        return 0.0, history
+# TODO:
+# Also add a pair of reversible jump operators which split a change into two or merge two adjacent changes into one.
 
 
 def add_change(model, history):
