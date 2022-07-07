@@ -1571,7 +1571,7 @@ def remove_change(model, history):
             random_change,
             random_node,
         ) = removable_change(history)
-    except IndexError:
+    except ValueError:
         return -numpy.inf, history
 
     after = history.after(history._times[random_change, random_node], random_node)

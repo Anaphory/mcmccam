@@ -204,10 +204,10 @@ class MCMCTest:
         self.true = 32
         self.mcmc = 64
         self.mcmc_steps = 200
-        self.true = 4
-        self.mcmc = 4
-        self.mcmc_steps = 8
-        self.significance = 1e-4
+        self.true = 8
+        self.mcmc = 8
+        self.mcmc_steps = 10
+        self.significance = 1e-3
 
     def compute_statistics(self, history):
         yield "n_changes", len(history.all_changes())
