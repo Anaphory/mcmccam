@@ -1315,8 +1315,10 @@ def split_change(model, history):
             # Both the change before and the change after are on different ends
             # of history, so change the value of the node – completely
             # throughout history – at random
-            _, alternative_history = gibbs_redraw_start(history, node=random_node)
-            return 0.0, alternative_history
+            hastings, alternative_history = gibbs_redraw_start(
+                history, node=random_node
+            )
+            return hastings, alternative_history
         else:
             # print("Sub 3")
             # Add a new change at the end
@@ -1324,10 +1326,10 @@ def split_change(model, history):
             new_change_pos = bisect.bisect(changes, (new_change_time, random_node, -1))
             changes.insert(new_change_pos, (new_change_time, random_node, -1))
             alternative_history = History(history.start(), changes, history.end)
-            _, alternative_history = gibbs_redraw_change(
+            hastings, alternative_history = gibbs_redraw_change(
                 alternative_history, change=(new_change_time, random_node, -1)
             )
-            return 0.0, alternative_history
+            return hastings, alternative_history
     else:
         if mid <= 0.0:
             # The second change is inside history, but it wasn't before.
@@ -1387,11 +1389,11 @@ def split_change(model, history):
             )
 
             alternative_history = History(history.start(), changes, history.end)
-            _, alternative_history = gibbs_redraw_change(
+            hastings, alternative_history = gibbs_redraw_change(
                 alternative_history,
                 change=(move_existing_change_to, random_node, value_of_second_change),
             )
-            return 0.0, alternative_history
+            return hastings, alternative_history
 
 
 def merge_changes(model, history):
@@ -1458,9 +1460,9 @@ def merge_changes(model, history):
 def add_change(model, history):
     pos = numpy.random.uniform(0.0, history.end)
     random_node = numpy.random.randint(len(history.start()))
-    # FIXME: Add test that new_value also must differ from the next change, if
-    # there is one. Otherwise, subtract only 1.
     after = history.after(pos, random_node)
+    # New_value also must differ from the next change, if there is one (so two
+    # values are forbidden). Otherwise, subtract only 1.
     if after is None:
         skip = 1
     else:
@@ -1477,36 +1479,100 @@ def add_change(model, history):
         changes,
         (pos, random_node, new_value),
     )
-    return numpy.log(
+    return -numpy.log(
         history.end * len(history.start()) * (model.nlang - skip)
     ), History(history.start(), changes, history.end)
 
 
-def remove_change(model, history):
-    # Pick a pair of subsequent random changes
-    n_changes = ((history._times <= history.end)).sum(0) - 1
+def removable_change(history: History) -> ():
+    """Find a random change that can be removed.
+
+    A change that can be removed is one where the value before the change is
+    different from the value after the next change. (Any final change can
+    always be removed.)
+
+    Returns
+    =======
+    change_index, node: int, int
+        The 2-part multiindex into history._states and history._times for the change.
+
+    Raises
+    ======
+
+    Only a history with no changes has no removable changes. In that case, we
+    raise a ValueError.
+
+    >>> h = History(["A", "A"], [], end=2.0)
+    >>> removable_change(h)
+    Traceback (most recent call last):
+    [...]
+    ValueError: ("History History(array(['A', 'A'], dtype='<U1'), [], 2.0) has no changes to remove.", History(array(['A', 'A'], dtype='<U1'), [], 2.0))
+
+    Examples
+    ========
+
+    If there is only one change, it is deterministically the result of this
+    function.
+
+    >>> h = History(["A", "A"], [(0.5, 0, "B")], end=2.0)
+    >>> removable_change(h)
+    (1, 0)
+
+    In the following example, the first change (which would be described as
+    `(1, 0)` like above) is not removable, so the second change is the only
+    option.
+
+    >>> h = History(["A", "A"], [(0.5, 0, "B"), (0.6, 0, "A")], end=2.0)
+    >>> removable_change(h)
+    (2, 0)
+
+    A longer quantitative example:
+
+    >>> from collections import Counter
+    >>> from scipy.stats import binomtest
+    >>> h = History(["A", "A", "B"], [(0.3, 1, "B"), (0.4, 2, "A"), (0.5, 0, "B"), (0.6, 0, "A"), (0.7, 1, "A"), (0.8, 0, "B"), (0.9, 2, "C")], end=2.0)
+    >>> c = Counter()
+    >>> for i in range(200):
+    ...   c[removable_change(h)] += 1
+    >>> c[(3, 0)] + c[(2, 1)] + c[(1, 2)] + c[(2, 2)]
+    200
+    >>> binomtest(c[(3, 0)], 200, 0.25).pvalue > 1e-3
+    True
+    >>> binomtest(c[(2, 1)], 200, 0.25).pvalue > 1e-3
+    True
+    >>> binomtest(c[(1, 2)], 200, 0.25).pvalue > 1e-3
+    True
+    >>> binomtest(c[(2, 2)], 200, 0.25).pvalue > 1e-3
+    True
+
+    """
+    valid_changes = numpy.ones(history._times.shape, dtype=bool)
+    if len(history._states) > 1:
+        valid_changes[1:-1] = history._states[:-2] != history._states[2:]
+    n_changes = ((history._times <= history.end) & valid_changes).sum(0) - 1
     heap = n_changes.cumsum()
     if heap[-1] == 0:
-        return -numpy.inf, history
+        raise ValueError(f"History {history} has no changes to remove.", history)
     random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
     random_change = numpy.random.randint(1, n_changes[random_node] + 1)
+    for i, v in enumerate(valid_changes[:, random_node]):
+        if not v:
+            random_change += 1
+        elif i >= random_change:
+            break
+    return random_change, random_node
 
-    # We cannot remove a change that has the same state before and after its
-    # interval.
+
+def remove_change(model, history):
+    # Pick a random change that is not undone (i.e. the value before its
+    # segment and the value after it are different).
     try:
-        while (
-            history._states[random_change - 1, random_node]
-            == history._states[random_change + 1, random_node]
-        ):
-            # There must be a change back to the starting value after this
-            # change, and that one would be safe to remove, so this loop can
-            # stochastically run very long, but there are bound to be options
-            # that terminate it. (There is probably a better implementation.)
-            random_node = bisect.bisect(heap, numpy.random.randint(heap[-1]))
-            random_change = numpy.random.randint(1, n_changes[random_node] + 1)
+        (
+            random_change,
+            random_node,
+        ) = removable_change(history)
     except IndexError:
-        # The change is just before the end of the history, so it is safe for remove.
-        pass
+        return -numpy.inf, history
 
     after = history.after(history._times[random_change, random_node], random_node)
     if after is None:
@@ -1522,7 +1588,7 @@ def remove_change(model, history):
             history._states[random_change, random_node],
         )
     )
-    return -numpy.log(
+    return numpy.log(
         history.end * len(history.start()) * (model.nlang - skip)
     ), History(history.start(), changes, history.end)
 
@@ -1534,16 +1600,19 @@ def add_or_remove_change(model, history):
         return remove_change(model, history)
 
 
-def select_operator():
-    all_operators = [add_or_remove_change, gibbs_redraw_change, gibbs_redraw_start] + [
-        move_change
-    ] * 2
+def select_operator(rj=True):
+    if rj == "only":
+        all_operators = []
+    else:
+        all_operators = [gibbs_redraw_change, gibbs_redraw_start] + [move_change] * 2
+    if rj:
+        all_operators.append(add_or_remove_change)
     return all_operators[numpy.random.randint(len(all_operators))]
 
 
-def step_mcmc(model, history, loglikelihood) -> tuple[History, float]:
+def step_mcmc(model, history, loglikelihood, rj=True) -> tuple[History, float]:
     """Execute a single MCMC step"""
-    operator = select_operator()
+    operator = select_operator(rj=rj)
     hastings_ratio, candidate_history = operator(model, deepcopy(history))
     if hastings_ratio == -numpy.inf:
         # print(operator.__name__, "rejected: Impossible")
